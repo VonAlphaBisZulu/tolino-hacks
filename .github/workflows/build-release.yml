@@ -26,9 +26,8 @@ jobs:
 
       - name: Install ARM cross-compiler
         run: |
-          sudo dpkg --add-architecture armhf
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf libcrypt-dev:armhf
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
 
       - name: Build libtolinom.so
         run: bash build.sh "$GITHUB_WORKSPACE"
