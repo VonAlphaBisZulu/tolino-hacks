@@ -12,27 +12,45 @@ WORKDIR=$(mktemp -d)
 trap "rm -rf $WORKDIR" EXIT
 cd "$WORKDIR"
 
+# Ensure cross-compile libcrypt is available (needed for password auth)
+EXTRA_CFLAGS=""
+EXTRA_LDFLAGS=""
+echo '#include <crypt.h>' > test_crypt.c
+echo 'int main(){ crypt("",""); return 0; }' >> test_crypt.c
+if ! arm-linux-gnueabihf-gcc -static test_crypt.c -lcrypt -o /dev/null 2>/dev/null; then
+    echo "Fetching armhf libcrypt..."
+    SYSROOT="$WORKDIR/armhf-sysroot"
+    mkdir -p "$SYSROOT"
+    # Download armhf packages directly from Ubuntu ports (avoids multiarch)
+    wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt-dev_4.4.33-2_armhf.deb" -O crypt-dev.deb 2>/dev/null || \
+    wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt-dev_4.4.36-4_armhf.deb" -O crypt-dev.deb 2>/dev/null || true
+    wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt1_4.4.33-2_armhf.deb" -O crypt1.deb 2>/dev/null || \
+    wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt1_4.4.36-4_armhf.deb" -O crypt1.deb 2>/dev/null || true
+    dpkg -x crypt-dev.deb "$SYSROOT/" 2>/dev/null || true
+    dpkg -x crypt1.deb "$SYSROOT/" 2>/dev/null || true
+    # Point compiler at the extracted headers and libraries
+    if [ -d "$SYSROOT/usr/include" ]; then
+        EXTRA_CFLAGS="-I$SYSROOT/usr/include"
+        EXTRA_LDFLAGS="-L$SYSROOT/usr/lib/arm-linux-gnueabihf"
+    fi
+fi
+rm -f test_crypt.c
+
+# Final check: if we still can't link crypt, disable password auth
+HAS_PASSWD=1
+echo '#include <crypt.h>' > test_crypt.c
+echo 'int main(){ crypt("",""); return 0; }' >> test_crypt.c
+if ! arm-linux-gnueabihf-gcc -static $EXTRA_CFLAGS $EXTRA_LDFLAGS test_crypt.c -lcrypt -o /dev/null 2>/dev/null; then
+    echo "WARNING: libcrypt unavailable — password auth disabled (key-only)"
+    HAS_PASSWD=0
+fi
+rm -f test_crypt.c
+
 wget -q "$URL"
 tar xjf "dropbear-${VERSION}.tar.bz2"
 cd "dropbear-${VERSION}"
 
-# Check if cross-compile libcrypt is available for static password auth
-CROSS_SYSROOT=$(arm-linux-gnueabihf-gcc -print-sysroot 2>/dev/null || echo "")
-HAS_LIBCRYPT=0
-if [ -n "$CROSS_SYSROOT" ]; then
-    find "$CROSS_SYSROOT" -name 'libcrypt.a' 2>/dev/null | grep -q . && HAS_LIBCRYPT=1
-fi
-# Also check the linker directly
-if [ "$HAS_LIBCRYPT" = "0" ]; then
-    echo 'int main(){}' > /tmp/test_crypt.c
-    arm-linux-gnueabihf-gcc -static /tmp/test_crypt.c -lcrypt -o /dev/null 2>/dev/null && HAS_LIBCRYPT=1
-    rm -f /tmp/test_crypt.c
-fi
-
-if [ "$HAS_LIBCRYPT" = "1" ]; then
-    echo "libcrypt found — building with password auth"
-else
-    echo "libcrypt NOT found — disabling password auth (key-only)"
+if [ "$HAS_PASSWD" = "0" ]; then
     cat > localoptions.h << 'EOF'
 #define DROPBEAR_SVR_PASSWORD_AUTH 0
 #define DROPBEAR_CLI_PASSWORD_AUTH 0
@@ -41,7 +59,7 @@ fi
 
 ./configure --host=arm-linux-gnueabihf --disable-zlib --disable-lastlog \
     --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
-    CC=arm-linux-gnueabihf-gcc LDFLAGS="-static" CFLAGS="-Os" \
+    CC=arm-linux-gnueabihf-gcc LDFLAGS="-static $EXTRA_LDFLAGS" CFLAGS="-Os $EXTRA_CFLAGS" \
     2>&1 | tail -3
 
 make PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 STATIC=1 -j$(nproc) \
@@ -60,4 +78,4 @@ else
 fi
 
 ls -lh dropbearmulti
-echo "=== Done ==="
+[ "$HAS_PASSWD" = "1" ] && echo "=== Done (password auth ENABLED) ===" || echo "=== Done (key-only, no password auth) ==="

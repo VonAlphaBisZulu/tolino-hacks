@@ -71,13 +71,14 @@ jobs:
             3. Eject and reboot — the device will process the update
 
             **After reboot:**
-            - SSH: `ssh -p 2222 root@<device-ip>`
-            - Default password: `tolinopass42`
-            - Scripts menu: Mehr > Scripts
+            1. Go to **Mehr > Scripts > SSH Start**
+            2. A dialog shows your auto-generated credentials:
+               `ssh -p 2222 root@<ip> pw: <random>`
+            3. Connect from any device on the same local network
 
-            SSH is restricted to local networks only (192.168.x, 10.x, 172.16-31.x).
-            To use key auth instead, place your public key as `.adds/authorized_keys`
-            on the device before applying the update.
+            SSH is restricted to local networks (192.168.x, 10.x, 172.16-31.x).
+            For key auth, place your public key as `.adds/authorized_keys` on the
+            device via USB before applying the update.
 
             See [README](https://github.com/VonAlphaBisZulu/tolino-hacks/blob/main/README.md) for full documentation.
           files: |
