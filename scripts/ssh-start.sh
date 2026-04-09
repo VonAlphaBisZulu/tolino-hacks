@@ -1,6 +1,6 @@
 #!/bin/sh
 # Start SSH and display credentials.
-# Password is derived from the device serial number — unique per device,
+# Password is derived from device serial + MAC — unique per device,
 # stable across reboots, recoverable without the device displaying it.
 # If authorized_keys exists, key auth is used instead (no password).
 
@@ -14,7 +14,6 @@ STATUS="/mnt/onboard/cloud-status.txt"
 AUTH="password"
 if [ -f /home/root/.ssh/authorized_keys ] || [ -f "$ADDS/authorized_keys" ]; then
     AUTH="key"
-    # Ensure authorized_keys is in the right place
     if [ -f "$ADDS/authorized_keys" ]; then
         mkdir -p /home/root/.ssh
         cp "$ADDS/authorized_keys" /home/root/.ssh/authorized_keys
@@ -24,12 +23,10 @@ if [ -f /home/root/.ssh/authorized_keys ] || [ -f "$ADDS/authorized_keys" ]; the
 fi
 
 if [ "$AUTH" = "password" ]; then
-    # Derive password from device serial (stable, unique, recoverable)
-    # Sources tried in order: /mnt/onboard/.kobo/version, machine-id, hostname
-    SERIAL=$(head -1 /mnt/onboard/.kobo/version 2>/dev/null)
-    [ -z "$SERIAL" ] && SERIAL=$(cat /etc/machine-id 2>/dev/null)
-    [ -z "$SERIAL" ] && SERIAL=$(hostname)
-    PW=$(echo -n "tolino-hacks-ssh:${SERIAL}" | md5sum | head -c 12)
+    # Derive password from device serial + MAC (stable, unique)
+    SERIAL=$(cat /mnt/onboard/.kobo/version 2>/dev/null | cut -d',' -f1)
+    MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null)
+    PW=$(echo -n "tolino-hacks-ssh:${SERIAL}:${MAC}" | md5sum | cut -c1-12)
     echo "root:$PW" | chpasswd 2>/dev/null
 fi
 
@@ -46,16 +43,6 @@ if ! pidof dropbearmulti >/dev/null 2>&1; then
         -r /etc/dropbear_ed25519_host_key \
         -p 2222 $EXTRA &
 fi
-
-# Restrict to local networks
-iptables -D INPUT -p tcp --dport 2222 -j DROP 2>/dev/null
-iptables -D INPUT -p tcp --dport 2222 -s 192.168.0.0/16 -j ACCEPT 2>/dev/null
-iptables -D INPUT -p tcp --dport 2222 -s 10.0.0.0/8 -j ACCEPT 2>/dev/null
-iptables -D INPUT -p tcp --dport 2222 -s 172.16.0.0/12 -j ACCEPT 2>/dev/null
-iptables -A INPUT -p tcp --dport 2222 -s 192.168.0.0/16 -j ACCEPT
-iptables -A INPUT -p tcp --dport 2222 -s 10.0.0.0/8 -j ACCEPT
-iptables -A INPUT -p tcp --dport 2222 -s 172.16.0.0/12 -j ACCEPT
-iptables -A INPUT -p tcp --dport 2222 -j DROP
 
 # Get device IP
 IP=$(ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2)

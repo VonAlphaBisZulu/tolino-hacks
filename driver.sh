@@ -8,7 +8,7 @@
 # The dialog will display your auto-generated credentials:
 #   ssh -p 2222 root@<device-ip> pw: <random-password>
 #
-# SSH is restricted to local networks only (192.168.x, 10.x, 172.16-31.x).
+# Password is derived from the device serial — unique per device, stable.
 # To use key auth instead, place your public key as .adds/authorized_keys
 # on the device via USB before applying the update.
 
