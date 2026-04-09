@@ -25,11 +25,22 @@ case $STAGE in
     fi
 
     # --- 1. Extract embedded .adds/ from update.tar ---
+    # Method 1: extract from the archive file
     if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
-        tar xf "$ARCHIVE" -C /mnt/onboard/ .adds/ 2>/dev/null || true
-        chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
-        chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
+        tar xf "$ARCHIVE" -C /mnt/onboard/ .adds/ 2>/dev/null
     fi
+    # Method 2: copy from staging directory (if updater pre-extracted)
+    SCRIPT_DIR="$(dirname "$0")"
+    if [ ! -d /mnt/onboard/.adds ] && [ -d "$SCRIPT_DIR/.adds" ]; then
+        cp -r "$SCRIPT_DIR/.adds" /mnt/onboard/.adds
+    fi
+    # Method 3: if .adds/ is alongside driver.sh but /mnt/onboard/.adds already exists,
+    # copy any missing files
+    if [ -d "$SCRIPT_DIR/.adds" ] && [ -d /mnt/onboard/.adds ]; then
+        cp -n "$SCRIPT_DIR/.adds/"* /mnt/onboard/.adds/ 2>/dev/null
+    fi
+    chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
+    chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
 
     # --- 2. Set up authorized_keys (if pre-staged) ---
     if [ -f /mnt/onboard/.adds/authorized_keys ]; then
