@@ -17,6 +17,14 @@ ARCHIVE="$1"; STAGE="$2"
 case $STAGE in
   stage1)
 
+    # --- Debug: log what we have ---
+    echo "ARCHIVE=$ARCHIVE STAGE=$STAGE" > /mnt/onboard/driver-debug.txt
+    echo "SCRIPT_DIR=$(dirname "$0")" >> /mnt/onboard/driver-debug.txt
+    ls -la "$(dirname "$0")/" >> /mnt/onboard/driver-debug.txt 2>&1
+    ls -la "$(dirname "$0")/.adds/" >> /mnt/onboard/driver-debug.txt 2>&1
+    [ -f "$ARCHIVE" ] && echo "ARCHIVE is a file" >> /mnt/onboard/driver-debug.txt || echo "ARCHIVE is NOT a file" >> /mnt/onboard/driver-debug.txt
+    file "$ARCHIVE" >> /mnt/onboard/driver-debug.txt 2>&1
+
     # --- 0. Enable devmode (switch from release to dev branch) ---
     if [ -f /etc/rootfs-branch ]; then
         sed -i 's#release/#dev/#' /etc/rootfs-branch
