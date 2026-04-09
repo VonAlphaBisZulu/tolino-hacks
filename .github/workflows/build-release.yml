@@ -17,10 +17,10 @@ jobs:
           sudo apt-get install -y -qq gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
 
       - name: Build libtolinom.so
-        run: bash build.sh .
+        run: bash build.sh "$GITHUB_WORKSPACE"
 
       - name: Build dropbearmulti
-        run: bash build-dropbear.sh .
+        run: bash build-dropbear.sh "$GITHUB_WORKSPACE/dropbearmulti"
 
       - name: Verify artifacts
         run: |
