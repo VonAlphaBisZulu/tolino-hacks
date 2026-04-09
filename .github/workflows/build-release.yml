@@ -8,8 +8,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Determine version tag
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            TAG="v$(date -u +%Y%m%d)-$(echo $GITHUB_SHA | head -c 7)"
+            git tag "$TAG"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install ARM cross-compiler
         run: |
@@ -47,6 +60,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
           body: |
             ## Installation
