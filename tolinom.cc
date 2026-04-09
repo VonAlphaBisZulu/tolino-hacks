@@ -113,8 +113,8 @@ static void show_scripts_dialog(void *moreview) {
         return;
     }
 
-    // Create ConfirmationDialog
-    void *dlg = fn_new(8192);
+    // Create ConfirmationDialog (32KB: unknown real size, overallocate to be safe)
+    void *dlg = fn_new(32768);
     if (!dlg) return;
     fn_dlgCtor(dlg, (void*)moreview);
 
@@ -162,8 +162,7 @@ static void show_scripts_dialog(void *moreview) {
 
     if (fn_setText && fn_setAccBtn && fn_exec) {
         for (int i = 0; i < nscripts; i++) {
-            // Create a fresh dialog for each option
-            void *d = fn_new(8192);
+            void *d = fn_new(32768);
             if (!d) continue;
             fn_dlgCtor(d, (void*)moreview);
 
@@ -203,7 +202,7 @@ static void show_scripts_dialog(void *moreview) {
                             ubuf[j] = (char16_t)sbuf[j];
                             slen++;
                         }
-                        void *sd = fn_new(8192);
+                        void *sd = fn_new(32768);
                         if (sd) {
                             fn_dlgCtor(sd, (void*)moreview);
                             STACK_QS(stitle, u"Cloud Status", 12);
@@ -238,9 +237,9 @@ void nm_hook_setupUi(void *_this, QWidget *widget) {
     void *layout = fn_layout(widget);
     if (!layout) { dbglog("no layout"); return; }
 
-    // Create Scripts button
+    // Create Scripts button (32KB: we don't know the real object size, overallocate to be safe)
     STACK_QS(label, u"Scripts", 7);
-    void *btn = fn_new(4096);
+    void *btn = fn_new(32768);
     if (!btn) return;
     fn_btnCtor(btn, &label, widget);
 
@@ -295,20 +294,63 @@ void nm_hook_betaFeatures(void *_this) {
 // Trigger file: MCP or shell scripts can create this to request a library sync
 #define SYNC_TRIGGER "/tmp/tolinom-sync-request"
 
+static volatile int g_syncInProgress = 0;
+
+// Direct sync call — only safe from the main (Qt/nickel) thread.
 static void do_library_sync() {
+    if (__sync_lock_test_and_set(&g_syncInProgress, 1)) {
+        dbglog("sync already in progress, skipping");
+        return;
+    }
     typedef void* (*getInstance_t)();
     typedef void  (*sync_t)(void*);
-    getInstance_t fn_gi = (getInstance_t)dlsym(RTLD_DEFAULT,
+    static getInstance_t fn_gi = nullptr;
+    static sync_t fn_sy = nullptr;
+    if (!fn_gi) fn_gi = (getInstance_t)dlsym(RTLD_DEFAULT,
         "_ZN19PlugWorkflowManager14sharedInstanceEv");
-    sync_t fn_sy = (sync_t)dlsym(RTLD_DEFAULT,
+    if (!fn_sy) fn_sy = (sync_t)dlsym(RTLD_DEFAULT,
         "_ZN19PlugWorkflowManager4syncEv");
     if (fn_gi && fn_sy) {
         void *mgr = fn_gi();
         if (mgr) {
-            dbglog("poll: triggering PlugWorkflowManager::sync()");
+            dbglog("triggering PlugWorkflowManager::sync()");
             fn_sy(mgr);
         }
     }
+    __sync_lock_release(&g_syncInProgress);
+}
+
+// Queue sync to run on the main thread via QTimer::singleShot.
+// Safe to call from any thread. Falls back to direct call if sync()
+// isn't a registered Qt slot (which prints a warning but doesn't crash).
+static void do_library_sync_queued() {
+    if (__sync_fetch_and_add(&g_syncInProgress, 0)) {
+        dbglog("sync already in progress, skipping queued request");
+        return;
+    }
+    // QTimer::singleShot(int msec, const QObject *receiver, const char *member)
+    typedef void (*singleShot_t)(int, const void*, const char*);
+    static singleShot_t fn_ss = nullptr;
+    if (!fn_ss) fn_ss = (singleShot_t)dlsym(RTLD_DEFAULT,
+        "_ZN6QTimer10singleShotEiPK7QObjectPKc");
+
+    typedef void* (*getInstance_t)();
+    static getInstance_t fn_gi = nullptr;
+    if (!fn_gi) fn_gi = (getInstance_t)dlsym(RTLD_DEFAULT,
+        "_ZN19PlugWorkflowManager14sharedInstanceEv");
+
+    if (fn_ss && fn_gi) {
+        void *mgr = fn_gi();
+        if (mgr) {
+            // "1sync()" = SLOT(sync()) — queues on receiver's thread (main thread)
+            dbglog("queuing sync via QTimer::singleShot on main thread");
+            fn_ss(0, mgr, "1sync()");
+            return;
+        }
+    }
+    // Fallback: direct call (if QTimer or PlugWorkflowManager not available)
+    dbglog("WARNING: QTimer::singleShot unavailable, direct sync call from poll thread");
+    do_library_sync();
 }
 
 // Poll thread: checks button states and watches for sync trigger file
@@ -318,9 +360,10 @@ static void *poll_thread(void *) {
     while (g_pollRunning) {
         usleep(150000); // 150ms
         // Check for sync trigger from MCP/shell (always, even before syms resolved)
+        // Use queued version — marshals to main thread via QTimer::singleShot
         if (access(SYNC_TRIGGER, F_OK) == 0) {
             unlink(SYNC_TRIGGER);
-            do_library_sync();
+            do_library_sync_queued();
         }
         if (!fn_isChecked) continue;
         if (!fn_sc) fn_sc = (setChecked_t)dlsym(RTLD_DEFAULT, "_ZN15QAbstractButton10setCheckedEb");
@@ -336,7 +379,7 @@ static void *poll_thread(void *) {
 }
 
 static int nm_init(){
-    dbglog("init v4");
+    dbglog("init v5 (thread-safe sync)");
     if(!access("/mnt/onboard/.adds/tolinom.disabled",F_OK)){dbglog("disabled");return 1;}
     dbglog("orig_setupUi=%p orig_betaFeatures=%p", orig_setupUi, orig_betaFeatures);
 
@@ -347,7 +390,7 @@ static int nm_init(){
     return 0;
 }
 
-static struct nh_info info={.name="TolinoM",.desc="Scripts menu v4",.failsafe_delay=15};
+static struct nh_info info={.name="TolinoM",.desc="Scripts menu v5",.failsafe_delay=15};
 static struct nh_hook hooks[]={
     {
         .sym="_ZN11Ui_MoreView7setupUiEP7QWidget",
