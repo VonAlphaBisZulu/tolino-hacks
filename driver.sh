@@ -6,7 +6,7 @@
 #
 # After reboot, go to: Mehr > Scripts > SSH Start
 # The dialog will display your auto-generated credentials:
-#   ssh -p 2222 root@<device-ip> pw: <random-password>
+#   ssh -p 2222 root@<device-ip> pw:<password>
 #
 # Password is derived from the device serial — unique per device, stable.
 # To use key auth instead, place your public key as .adds/authorized_keys
@@ -17,14 +17,6 @@ ARCHIVE="$1"; STAGE="$2"
 case $STAGE in
   stage1)
 
-    # --- Debug: log what we have ---
-    echo "ARCHIVE=$ARCHIVE STAGE=$STAGE" > /mnt/onboard/driver-debug.txt
-    echo "SCRIPT_DIR=$(dirname "$0")" >> /mnt/onboard/driver-debug.txt
-    ls -la "$(dirname "$0")/" >> /mnt/onboard/driver-debug.txt 2>&1
-    ls -la "$(dirname "$0")/.adds/" >> /mnt/onboard/driver-debug.txt 2>&1
-    [ -f "$ARCHIVE" ] && echo "ARCHIVE is a file" >> /mnt/onboard/driver-debug.txt || echo "ARCHIVE is NOT a file" >> /mnt/onboard/driver-debug.txt
-    file "$ARCHIVE" >> /mnt/onboard/driver-debug.txt 2>&1
-
     # --- 0. Enable devmode (switch from release to dev branch) ---
     if [ -f /etc/rootfs-branch ]; then
         sed -i 's#release/#dev/#' /etc/rootfs-branch
@@ -32,23 +24,36 @@ case $STAGE in
         sed -i 's#release/#dev/#' /usr/local/Kobo/branch
     fi
 
-    # --- 1. Extract embedded .adds/ from update.tar ---
-    # Method 1: extract from the archive file
-    if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
-        tar xf "$ARCHIVE" -C /mnt/onboard/ .adds/ 2>/dev/null
-    fi
-    # Method 2: copy from staging directory (if updater pre-extracted)
+    # --- 1. Stage .adds/ files to /etc/tolino-hacks/ ---
+    # /mnt/onboard/ may not be writable during the update process,
+    # so we store files on the root filesystem first. The init script
+    # copies them to /mnt/onboard/.adds/ on first boot.
+    mkdir -p /etc/tolino-hacks
     SCRIPT_DIR="$(dirname "$0")"
-    if [ ! -d /mnt/onboard/.adds ] && [ -d "$SCRIPT_DIR/.adds" ]; then
-        cp -r "$SCRIPT_DIR/.adds" /mnt/onboard/.adds
+
+    # Try to extract from archive
+    if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
+        tar xf "$ARCHIVE" -C /etc/tolino-hacks/ .adds/ 2>/dev/null
+        # If .adds/ was extracted inside tolino-hacks, flatten it
+        if [ -d /etc/tolino-hacks/.adds ]; then
+            cp /etc/tolino-hacks/.adds/* /etc/tolino-hacks/ 2>/dev/null
+            rm -rf /etc/tolino-hacks/.adds
+        fi
     fi
-    # Method 3: if .adds/ is alongside driver.sh but /mnt/onboard/.adds already exists,
-    # copy any missing files
-    if [ -d "$SCRIPT_DIR/.adds" ] && [ -d /mnt/onboard/.adds ]; then
-        cp -n "$SCRIPT_DIR/.adds/"* /mnt/onboard/.adds/ 2>/dev/null
+    # Copy from staging directory (if updater pre-extracted)
+    if [ -d "$SCRIPT_DIR/.adds" ]; then
+        cp "$SCRIPT_DIR/.adds/"* /etc/tolino-hacks/ 2>/dev/null
     fi
-    chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
-    chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
+    chmod +x /etc/tolino-hacks/dropbearmulti 2>/dev/null
+    chmod +x /etc/tolino-hacks/*.sh 2>/dev/null
+
+    # Also try writing directly to /mnt/onboard/.adds/ (may work on some devices)
+    if [ -w /mnt/onboard/ ]; then
+        mkdir -p /mnt/onboard/.adds
+        cp /etc/tolino-hacks/* /mnt/onboard/.adds/ 2>/dev/null
+        chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
+        chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
+    fi
 
     # --- 2. Set up authorized_keys (if pre-staged) ---
     if [ -f /mnt/onboard/.adds/authorized_keys ]; then
@@ -58,11 +63,18 @@ case $STAGE in
         chmod 600 /home/root/.ssh/authorized_keys
     fi
 
-    # --- 3. Init script: start SSH on boot ---
+    # --- 3. Init script: deploy and start SSH on boot ---
     cat > /etc/init.d/S99custom << 'INITEOF'
 #!/bin/sh
 case "$1" in
     start)
+        # On first boot after update, copy staged files to .adds/
+        if [ -d /etc/tolino-hacks ] && [ -f /etc/tolino-hacks/dropbearmulti ]; then
+            mkdir -p /mnt/onboard/.adds
+            cp -n /etc/tolino-hacks/* /mnt/onboard/.adds/ 2>/dev/null
+            chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
+            chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
+        fi
         [ -f /mnt/onboard/.adds/ssh-start.sh ] && /mnt/onboard/.adds/ssh-start.sh
         ;;
     stop)
@@ -79,9 +91,11 @@ INITEOF
     fi
 
     # --- 5. Generate SSH host keys ---
-    if [ -f /mnt/onboard/.adds/dropbearmulti ]; then
-        [ -f /etc/dropbear_rsa_host_key ] || /mnt/onboard/.adds/dropbearmulti dropbearkey -t rsa -f /etc/dropbear_rsa_host_key 2>/dev/null
-        [ -f /etc/dropbear_ed25519_host_key ] || /mnt/onboard/.adds/dropbearmulti dropbearkey -t ed25519 -f /etc/dropbear_ed25519_host_key 2>/dev/null
+    DBEAR="/etc/tolino-hacks/dropbearmulti"
+    [ -f "$DBEAR" ] || DBEAR="/mnt/onboard/.adds/dropbearmulti"
+    if [ -f "$DBEAR" ]; then
+        [ -f /etc/dropbear_rsa_host_key ] || "$DBEAR" dropbearkey -t rsa -f /etc/dropbear_rsa_host_key 2>/dev/null
+        [ -f /etc/dropbear_ed25519_host_key ] || "$DBEAR" dropbearkey -t ed25519 -f /etc/dropbear_ed25519_host_key 2>/dev/null
     fi
 
     sync
