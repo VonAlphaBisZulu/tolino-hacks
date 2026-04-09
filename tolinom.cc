@@ -145,20 +145,16 @@ static void show_scripts_dialog(void *moreview) {
 
     struct { const char16_t *label; long len; const char *cmd;
              const char16_t *desc; long dlen; } scripts[] = {
-        { u"Cloud Connect",   13, "/mnt/onboard/.adds/cloud-connect.sh &",
-          u"Start SSH and tunnel to chuzel.net", 34 },
-        { u"Cloud Disconnect",16, "/mnt/onboard/.adds/cloud-disconnect.sh &",
-          u"Stop the tunnel to chuzel.net", 29 },
-        { u"Cloud Status",    12, "/mnt/onboard/.adds/cloud-status.sh",
-          u"Check SSH and tunnel status", 27 },
-        { u"FAZ Download",    12, "/mnt/onboard/.adds/faz-download.sh &",
-          u"Download the latest FAZ epub", 28 },
+        { u"SSH Start",       9, "/mnt/onboard/.adds/ssh-start.sh",
+          u"Start SSH server (port 2222)", 28 },
+        { u"SSH Stop",        8, "/mnt/onboard/.adds/ssh-stop.sh",
+          u"Stop SSH server", 15 },
         { u"System Info",     11, "/mnt/onboard/.adds/sysinfo.sh &",
           u"Save system information to sysinfo.txt", 38 },
         { u"Refresh Library", 15, "__BUILTIN_REFRESH__",
           u"Rescan books via PlugWorkflowManager", 36 },
     };
-    int nscripts = 6;
+    int nscripts = 4;
 
     if (fn_setText && fn_setAccBtn && fn_exec) {
         for (int i = 0; i < nscripts; i++) {
@@ -187,9 +183,8 @@ static void show_scripts_dialog(void *moreview) {
                     system(scripts[i].cmd);
                 }
 
-                // For Cloud Status, show result in a follow-up dialog
-                if (i == 2) { // Cloud Status
-                    // Read status file
+                // Show status feedback if the script wrote a status file
+                {
                     FILE *sf = fopen("/mnt/onboard/cloud-status.txt", "r");
                     if (sf) {
                         char sbuf[256] = {0};
@@ -202,10 +197,11 @@ static void show_scripts_dialog(void *moreview) {
                             ubuf[j] = (char16_t)sbuf[j];
                             slen++;
                         }
+                        unlink("/mnt/onboard/cloud-status.txt");
                         void *sd = fn_new(32768);
                         if (sd) {
                             fn_dlgCtor(sd, (void*)moreview);
-                            STACK_QS(stitle, u"Cloud Status", 12);
+                            STACK_QS(stitle, u"Status", 6);
                             fn_setTitle(sd, &stitle);
                             FakeQString stext = {nullptr, ubuf, slen};
                             fn_setText(sd, &stext);

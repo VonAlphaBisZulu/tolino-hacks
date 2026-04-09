@@ -1,6 +1,9 @@
 #!/bin/bash
-# Cross-compile Dropbear SSH for ARM (static, ~719KB)
+# Cross-compile Dropbear SSH for ARM
 # Requires: arm-linux-gnueabihf-gcc
+#
+# Builds with password auth enabled (dynamically linked against device libc).
+# If authorized_keys exists on device, key auth is preferred.
 set -e
 
 VERSION="2024.86"
@@ -16,30 +19,24 @@ wget -q "$URL"
 tar xjf "dropbear-${VERSION}.tar.bz2"
 cd "dropbear-${VERSION}"
 
-# Key-based auth only (no password auth, avoids crypt() dependency)
-cat > localoptions.h << 'EOF'
-#define DROPBEAR_SVR_PASSWORD_AUTH 0
-#define DROPBEAR_CLI_PASSWORD_AUTH 0
-EOF
-
 ./configure --host=arm-linux-gnueabihf --disable-zlib --disable-lastlog \
     --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
-    CC=arm-linux-gnueabihf-gcc LDFLAGS="-static" CFLAGS="-Os" \
+    CC=arm-linux-gnueabihf-gcc CFLAGS="-Os" \
     2>&1 | tail -3
 
-make PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 STATIC=1 -j$(nproc) \
+make PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 -j$(nproc) \
     2>&1 | tail -3
 
 arm-linux-gnueabihf-strip dropbearmulti
 
-DEST="${OLDPWD:-$(pwd)}"
-# Try to copy back to the original working directory
+# Output
 if [ -n "$1" ]; then
     cp dropbearmulti "$1"
     echo "Saved to $1"
 else
-    cp dropbearmulti "$DEST/../dropbearmulti" 2>/dev/null || cp dropbearmulti /tmp/dropbearmulti
-    echo "Saved to $DEST/../dropbearmulti (or /tmp/dropbearmulti)"
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    cp dropbearmulti "$SCRIPT_DIR/dropbearmulti"
+    echo "Saved to $SCRIPT_DIR/dropbearmulti"
 fi
 
 ls -lh dropbearmulti
