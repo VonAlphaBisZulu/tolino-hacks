@@ -49,14 +49,16 @@ jobs:
           # Build self-contained update.tar with everything embedded
           STAGING=$(mktemp -d)
           cp driver.sh "$STAGING/"
+          chmod +x "$STAGING/driver.sh"
           mkdir -p "$STAGING/.adds"
           cp libtolinom.so "$STAGING/.adds/"
           cp dropbearmulti "$STAGING/.adds/"
           cp .env.example "$STAGING/.adds/"
           cp scripts/*.sh "$STAGING/.adds/" 2>/dev/null || true
+          chmod +x "$STAGING/.adds/"*.sh "$STAGING/.adds/dropbearmulti"
           (cd "$STAGING" && tar cf "$GITHUB_WORKSPACE/update.tar" driver.sh .adds/)
           echo "update.tar contents:"
-          tar tf update.tar
+          tar tvf update.tar
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
