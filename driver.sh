@@ -6,15 +6,19 @@
 #   /mnt/onboard/.adds/dropbearmulti     — Dropbear SSH static binary
 #   /mnt/onboard/.adds/libtolinom.so     — Hook library (from build.sh)
 #   /mnt/onboard/.adds/authorized_keys   — Your SSH public key
-#   /mnt/onboard/.adds/cloud-connect.sh  — (optional) tunnel script
-#   /mnt/onboard/.adds/cloud-disconnect.sh
-#   /mnt/onboard/.adds/cloud-status.sh
-#   /mnt/onboard/.adds/sysinfo.sh
+#   /mnt/onboard/.adds/*.sh              — (optional) shell scripts for menu
 
 ARCHIVE="$1"; STAGE="$2"
 
 case $STAGE in
   stage1)
+
+    # --- 0. Enable devmode (switch from release to dev branch) ---
+    if [ -f /etc/rootfs-branch ]; then
+        sed -i 's#release/#dev/#' /etc/rootfs-branch
+    elif [ -f /usr/local/Kobo/branch ]; then
+        sed -i 's#release/#dev/#' /usr/local/Kobo/branch
+    fi
 
     # --- 1. Init script: SSH server + TCP shell fallback ---
     cat > /etc/init.d/S99custom << 'INITEOF'

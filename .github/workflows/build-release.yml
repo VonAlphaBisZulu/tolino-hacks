@@ -1,0 +1,71 @@
+name: Build Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+
+      - name: Build libtolinom.so
+        run: bash build.sh .
+
+      - name: Build dropbearmulti
+        run: bash build-dropbear.sh .
+
+      - name: Verify artifacts
+        run: |
+          echo "=== libtolinom.so ==="
+          file libtolinom.so
+          ls -lh libtolinom.so
+          echo "=== dropbearmulti ==="
+          file dropbearmulti
+          ls -lh dropbearmulti
+
+      - name: Package update.tar and dot-adds.zip
+        run: |
+          # Create update.tar (contains driver.sh)
+          tar cf update.tar driver.sh
+
+          # Create .adds/ directory with all binaries and scripts
+          STAGING=$(mktemp -d)
+          mkdir -p "$STAGING/.adds"
+          cp libtolinom.so "$STAGING/.adds/"
+          cp dropbearmulti "$STAGING/.adds/"
+          cp scripts/*.sh "$STAGING/.adds/" 2>/dev/null || true
+          (cd "$STAGING" && zip -r "$GITHUB_WORKSPACE/dot-adds.zip" .adds/)
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            **First-time setup (two steps):**
+            1. Copy `update.tar` to device root via USB
+            2. Extract `dot-adds.zip` to device root (creates `.adds/` directory)
+            3. Eject and reboot
+
+            **After reboot:**
+            - SSH: `ssh -p 2222 root@<device-ip>` (requires authorized_keys in `.adds/`)
+            - TCP shell fallback: `nc <device-ip> 4444`
+            - Scripts menu: Mehr > Scripts
+
+            **SSH key setup:** Before installing, place your SSH public key as
+            `.adds/authorized_keys` on the device alongside the other files.
+
+            See [README](https://github.com/VonAlphaBisZulu/tolino-hacks/blob/main/README.md) for full documentation.
+          files: |
+            update.tar
+            dot-adds.zip
+            libtolinom.so
+            dropbearmulti

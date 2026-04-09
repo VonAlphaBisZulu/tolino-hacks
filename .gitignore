@@ -1,0 +1,10 @@
+*.o
+*.so
+dropbearmulti
+update.tar
+dot-adds.zip
+nh.c
+NickelHook.h
+authorized_keys
+tolino_client_key*
+.env
