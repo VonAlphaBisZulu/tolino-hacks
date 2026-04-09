@@ -1,11 +1,15 @@
 #!/bin/sh
 # Start SSH and reverse tunnel to your server.
-# Configure TUNNEL_USER, TUNNEL_HOST, and TUNNEL_KEY below.
+# Configure values in /mnt/onboard/.adds/.env (see .env.example)
 
+# Defaults (overridden by .env)
 TUNNEL_USER="user"
 TUNNEL_HOST="yourserver.com"
 TUNNEL_KEY="/mnt/onboard/.adds/tolino_client_key"
-TUNNEL_PORT="2223"  # remote port on server that forwards back to us
+TUNNEL_PORT="2223"
+
+# Load config
+[ -f /mnt/onboard/.adds/.env ] && . /mnt/onboard/.adds/.env
 
 DROPBEAR="/mnt/onboard/.adds/dropbearmulti"
 
