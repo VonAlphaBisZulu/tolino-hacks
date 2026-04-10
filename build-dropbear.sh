@@ -22,10 +22,11 @@ if ! arm-linux-gnueabihf-gcc -static test_crypt.c -lcrypt -o /dev/null 2>/dev/nu
     SYSROOT="$WORKDIR/armhf-sysroot"
     mkdir -p "$SYSROOT"
     # Download armhf packages directly from Ubuntu ports (avoids multiarch)
-    wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt-dev_4.4.33-2_armhf.deb" -O crypt-dev.deb 2>/dev/null || \
-    wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt-dev_4.4.36-4_armhf.deb" -O crypt-dev.deb 2>/dev/null || true
-    wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt1_4.4.33-2_armhf.deb" -O crypt1.deb 2>/dev/null || \
-    wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt1_4.4.36-4_armhf.deb" -O crypt1.deb 2>/dev/null || true
+    # Try multiple versions (22.04=4.4.27-1, 24.04=4.4.36-4)
+    for V in 4.4.27-1 4.4.33-2 4.4.36-4; do
+        [ -f crypt-dev.deb ] || wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt-dev_${V}_armhf.deb" -O crypt-dev.deb 2>/dev/null || rm -f crypt-dev.deb
+        [ -f crypt1.deb ] || wget -q "http://ports.ubuntu.com/pool/main/libx/libxcrypt/libcrypt1_${V}_armhf.deb" -O crypt1.deb 2>/dev/null || rm -f crypt1.deb
+    done
     dpkg -x crypt-dev.deb "$SYSROOT/" 2>/dev/null || true
     dpkg -x crypt1.deb "$SYSROOT/" 2>/dev/null || true
     # Point compiler at the extracted headers and libraries
