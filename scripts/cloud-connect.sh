@@ -13,8 +13,11 @@ TUNNEL_PORT="2223"
 
 DROPBEAR="/mnt/onboard/.adds/dropbearmulti"
 
-# Start dropbear if not running
-if ! pidof dropbearmulti >/dev/null 2>&1; then
+# Start dropbear if not running.
+# dropbearmulti is a multi-call binary: server runs as "dropbearmulti dropbear",
+# client as "dropbearmulti dbclient". pidof sees only argv[0] so distinguish
+# by full command line with pgrep -f.
+if ! pgrep -f 'dropbearmulti dropbear' >/dev/null 2>&1; then
     $DROPBEAR dropbear \
         -r /etc/dropbear_rsa_host_key \
         -r /etc/dropbear_ed25519_host_key \
@@ -23,7 +26,7 @@ if ! pidof dropbearmulti >/dev/null 2>&1; then
 fi
 
 # Start tunnel if not running
-if ! pidof dbclient >/dev/null 2>&1; then
+if ! pgrep -f 'dropbearmulti dbclient' >/dev/null 2>&1; then
     $DROPBEAR dbclient \
         -y -i "$TUNNEL_KEY" \
         -N -f -R "${TUNNEL_PORT}:localhost:2222" \

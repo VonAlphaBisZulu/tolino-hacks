@@ -59,6 +59,9 @@ typedef void  (*show_t)(void*);                             // QWidget::show()
 static setupUi_t orig_setupUi = nullptr;
 static void_fn_t orig_betaFeatures = nullptr;
 static void_fn_t orig_suspend = nullptr;
+typedef void (*suspendQS_t)(void*, const void*);
+static suspendQS_t orig_suspendDevice = nullptr;
+static suspendQS_t orig_suspendDeviceWithAlarm = nullptr;
 
 // Resolved Qt symbols
 static ctor_t     fn_btnCtor    = nullptr;
@@ -159,8 +162,13 @@ static void show_panel(void *parent) {
 
     for (;;) {
         // --- Read current state ---
-        bool ssh_on = (system("pidof dropbearmulti >/dev/null 2>&1") == 0);
-        bool tunnel_on = (system("pidof dbclient >/dev/null 2>&1") == 0);
+        // dbclient runs via the dropbearmulti multi-call binary, so argv[0]
+        // is "dropbearmulti" and pidof dbclient never matches. Detect both
+        // the server and the tunnel client by full command line match.
+        bool ssh_on = (system(
+            "pgrep -f 'dropbearmulti dropbear' >/dev/null 2>&1") == 0);
+        bool tunnel_on = (system(
+            "pgrep -f 'dropbearmulti dbclient' >/dev/null 2>&1") == 0);
 
         // Resolve SSH connection details (shown in the sub-label under the SSH row)
         char sshInfo[256] = {0};
@@ -187,7 +195,29 @@ static void show_panel(void *parent) {
             snprintf(sshInfo, sizeof(sshInfo), "off");
         }
 
-        const char *tunInfo = tunnel_on ? "connected" : "off";
+        // Tunnel sub-label: when active, surface the server details read from
+        // .env so the user can see which endpoint the tunnel is using and how
+        // an MCP client would reach it. TUNNEL_MCP_URL is optional.
+        char tunInfoBuf[256] = {0};
+        if (tunnel_on) {
+            char host[64] = {0};
+            char port[16] = {0};
+            char mcp[128] = {0};
+            run_capture(". /mnt/onboard/.adds/.env 2>/dev/null; printf '%s' \"${TUNNEL_HOST}\"", host, sizeof(host));
+            run_capture(". /mnt/onboard/.adds/.env 2>/dev/null; printf '%s' \"${TUNNEL_PORT:-2223}\"", port, sizeof(port));
+            run_capture(". /mnt/onboard/.adds/.env 2>/dev/null; printf '%s' \"${TUNNEL_MCP_URL}\"", mcp, sizeof(mcp));
+            if (host[0] && mcp[0])
+                snprintf(tunInfoBuf, sizeof(tunInfoBuf),
+                    "%s:%s -> localhost:2222\nMCP: %s", host, port, mcp);
+            else if (host[0])
+                snprintf(tunInfoBuf, sizeof(tunInfoBuf),
+                    "%s:%s -> localhost:2222", host, port);
+            else
+                snprintf(tunInfoBuf, sizeof(tunInfoBuf), "connected");
+        } else {
+            snprintf(tunInfoBuf, sizeof(tunInfoBuf), "off");
+        }
+        const char *tunInfo = tunInfoBuf;
 
         // --- Build dialog ---
         void *dlg = fn_new(32768);
@@ -280,13 +310,17 @@ static void show_panel(void *parent) {
         void *refreshTouch = makeMenuRow(
             u"\u21BB  Refresh Library", 18, false, false);
 
+        // WiFi reconnect action (useful after nickel drops the radio on sleep).
+        void *wifiTouch = makeMenuRow(
+            u"\u21BB  Reconnect WiFi", 18, false, false);
+
         // Hidden trackers — tap toggles tracker AND closes dialog.
-        // Slots for ssh / tunnel / refresh; the tunnel slot is nullptr in
-        // public builds and is simply skipped.
+        // Slots for ssh / tunnel / refresh / wifi; the tunnel slot is nullptr
+        // in public builds and is simply skipped.
         STACK_QS(emptyStr, u"", 0);
-        void *trackers[3] = {nullptr, nullptr, nullptr};
-        void *touches[3]  = {sshTouch, tunTouch, refreshTouch};
-        for (int i = 0; i < 3; i++) {
+        void *trackers[4] = {nullptr, nullptr, nullptr, nullptr};
+        void *touches[4]  = {sshTouch, tunTouch, refreshTouch, wifiTouch};
+        for (int i = 0; i < 4; i++) {
             if (!touches[i]) continue;
             trackers[i] = fn_new(32768);
             fn_btnCtor(trackers[i], &emptyStr, nullptr);
@@ -329,6 +363,10 @@ static void show_panel(void *parent) {
         if (trackers[2] && fn_isChecked(trackers[2])) {
             dbglog("panel: refreshing library");
             do_library_sync();
+        }
+        if (trackers[3] && fn_isChecked(trackers[3])) {
+            dbglog("panel: reconnecting wifi");
+            system("/mnt/onboard/.adds/wifi-reconnect.sh &");
         }
 
         // Loop back to show updated status
@@ -465,22 +503,52 @@ void nm_hook_betaFeatures(void *_this) {
     orig_betaFeatures(_this);
 }
 
-// Hook: PowerManager::suspend — block it while SSH is active so the
-// device doesn't soft-sleep and drop the WiFi/SSH listener. ssh-start.sh
-// touches /tmp/tolinom-keepawake; ssh-stop.sh removes it.
+// Helper: reset the PowerManager idle timer so nickel's next idle-check
+// starts over instead of immediately re-requesting sleep.
+static void pm_poke(void *_this) {
+    typedef void (*upd_t)(void*);
+    static upd_t fn_upd = nullptr;
+    if (!fn_upd) fn_upd = (upd_t)dlsym(RTLD_DEFAULT,
+        "_ZN12PowerManager14updateLastUsedEv");
+    if (fn_upd && _this) fn_upd(_this);
+}
+
+static bool keepawake_active() {
+    return access("/tmp/tolinom-keepawake", F_OK) == 0;
+}
+
+// Hooks: PowerManager sleep entry points. Multiple variants exist on this
+// firmware and we don't know which one nickel actually hits, so we block
+// them all when the keepawake flag is set. Only log when actually blocking
+// — logging every passthrough would grow the debug file indefinitely.
 __attribute__((visibility("default")))
 void nm_hook_suspend(void *_this) {
-    if (access("/tmp/tolinom-keepawake", F_OK) == 0) {
-        dbglog("suspend blocked — keepawake flag set");
-        // Reset the idle timer so nickel doesn't loop-retry immediately.
-        typedef void (*upd_t)(void*);
-        static upd_t fn_upd = nullptr;
-        if (!fn_upd) fn_upd = (upd_t)dlsym(RTLD_DEFAULT,
-            "_ZN12PowerManager14updateLastUsedEv");
-        if (fn_upd) fn_upd(_this);
+    if (keepawake_active()) {
+        dbglog("PM::suspend() blocked");
+        pm_poke(_this);
         return;
     }
     if (orig_suspend) orig_suspend(_this);
+}
+
+__attribute__((visibility("default")))
+void nm_hook_suspendDevice(void *_this, const void *reason) {
+    if (keepawake_active()) {
+        dbglog("PM::suspendDevice() blocked");
+        pm_poke(_this);
+        return;
+    }
+    if (orig_suspendDevice) orig_suspendDevice(_this, reason);
+}
+
+__attribute__((visibility("default")))
+void nm_hook_suspendDeviceWithAlarm(void *_this, const void *reason) {
+    if (keepawake_active()) {
+        dbglog("PM::suspendDeviceWithAlarm() blocked");
+        pm_poke(_this);
+        return;
+    }
+    if (orig_suspendDeviceWithAlarm) orig_suspendDeviceWithAlarm(_this, reason);
 }
 
 // Trigger file: MCP or shell scripts can create this to request a library sync
@@ -573,7 +641,9 @@ static void *poll_thread(void *) {
 static int nm_init(){
     dbglog("init v6 (panel UI)");
     if(!access("/mnt/onboard/.adds/tolinom.disabled",F_OK)){dbglog("disabled");return 1;}
-    dbglog("orig_setupUi=%p orig_betaFeatures=%p", orig_setupUi, orig_betaFeatures);
+    dbglog("orig_setupUi=%p orig_beta=%p orig_susp=%p orig_suspDev=%p orig_suspDevAl=%p",
+        orig_setupUi, orig_betaFeatures, orig_suspend,
+        orig_suspendDevice, orig_suspendDeviceWithAlarm);
 
     // Start polling thread
     g_pollRunning = true;
@@ -603,6 +673,20 @@ static struct nh_hook hooks[]={
         .sym_new="PLACEHOLDER_SUSPEND",
         .lib="libnickel.so.1.0.0",
         .out=(void**)&orig_suspend,
+        .optional=true,
+    },
+    {
+        .sym="_ZN12PowerManager13suspendDeviceERK7QString",
+        .sym_new="PLACEHOLDER_SUSPDEV",
+        .lib="libnickel.so.1.0.0",
+        .out=(void**)&orig_suspendDevice,
+        .optional=true,
+    },
+    {
+        .sym="_ZN12PowerManager22suspendDeviceWithAlarmERK7QString",
+        .sym_new="PLACEHOLDER_SUSPDEVAL",
+        .lib="libnickel.so.1.0.0",
+        .out=(void**)&orig_suspendDeviceWithAlarm,
         .optional=true,
     },
     {0}

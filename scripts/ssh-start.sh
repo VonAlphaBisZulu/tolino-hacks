@@ -26,8 +26,10 @@ MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null)
 PW=$(echo -n "tolino-hacks-ssh:${SERIAL}:${MAC}" | md5sum | cut -c1-12)
 echo "root:$PW" | chpasswd 2>/dev/null
 
-# Start dropbear if not running
-if ! pidof dropbearmulti >/dev/null 2>&1; then
+# Start dropbear if not running.
+# dropbearmulti is the same binary used by the outgoing tunnel (dbclient),
+# so match on full command line to distinguish server from client.
+if ! pgrep -f 'dropbearmulti dropbear' >/dev/null 2>&1; then
     [ -f /etc/dropbear_rsa_host_key ] || $DROPBEAR dropbearkey -t rsa -f /etc/dropbear_rsa_host_key 2>/dev/null
     [ -f /etc/dropbear_ed25519_host_key ] || $DROPBEAR dropbearkey -t ed25519 -f /etc/dropbear_ed25519_host_key 2>/dev/null
 
@@ -59,15 +61,15 @@ iwconfig wlan0 power off 2>/dev/null
 (
     IDLE_LIMIT=60   # 60 iterations * 20s = 20 min
     idle=0
-    while pidof dropbearmulti >/dev/null 2>&1; do
+    while pgrep -f 'dropbearmulti dropbear' >/dev/null 2>&1; do
         [ -f /sys/power/wake_lock ] && echo "tolino-hacks-ssh" > /sys/power/wake_lock 2>/dev/null
         echo on > /sys/class/net/wlan0/power/control 2>/dev/null
         iwconfig wlan0 power off 2>/dev/null
         GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
         [ -n "$GW" ] && ping -c 1 -W 2 "$GW" >/dev/null 2>&1
 
-        # Count dropbear processes: >1 means an active session exists
-        n=$(pidof dropbearmulti dropbear 2>/dev/null | wc -w)
+        # Active session count = dropbear server processes > 1 (listener + sessions)
+        n=$(pgrep -f 'dropbearmulti dropbear' 2>/dev/null | wc -l)
         if [ "$n" -gt 1 ]; then
             idle=0
         else

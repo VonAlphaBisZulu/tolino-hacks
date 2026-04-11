@@ -39,12 +39,18 @@ arm-linux-gnueabihf-gcc -c -fPIC -Os nh.c -o nh.o 2>/dev/null
 arm-linux-gnueabihf-g++ -c -fPIC -Os $EXTRA_CXXFLAGS -Wno-unused-result -Wno-unused-variable -Wno-unused-local-typedefs tolinom.cc -o tolinom.o
 arm-linux-gnueabihf-g++ -shared -o libtolinom.so tolinom.o nh.o -ldl
 
-SETUP=$(nm -D libtolinom.so | grep nm_hook_setupUi | awk '{print $3}')
-BETA=$(nm -D libtolinom.so | grep nm_hook_betaFeatures | awk '{print $3}')
-SUSPEND=$(nm -D libtolinom.so | grep nm_hook_suspend | awk '{print $3}')
-echo "SETUP=$SETUP BETA=$BETA SUSPEND=$SUSPEND"
+SETUP=$(nm -D libtolinom.so | grep ' T ' | grep nm_hook_setupUi | awk '{print $3}')
+BETA=$(nm -D libtolinom.so | grep ' T ' | grep nm_hook_betaFeatures | awk '{print $3}')
+SUSPEND=$(nm -D libtolinom.so | grep ' T ' | grep 'nm_hook_suspend$\|nm_hook_suspendPv$' | awk '{print $3}')
+SUSPDEV=$(nm -D libtolinom.so | grep ' T ' | grep nm_hook_suspendDevice | grep -v WithAlarm | awk '{print $3}')
+SUSPDEVAL=$(nm -D libtolinom.so | grep ' T ' | grep nm_hook_suspendDeviceWithAlarm | awk '{print $3}')
+echo "SETUP=$SETUP"
+echo "BETA=$BETA"
+echo "SUSPEND=$SUSPEND"
+echo "SUSPDEV=$SUSPDEV"
+echo "SUSPDEVAL=$SUSPDEVAL"
 
-if [ -z "$SETUP" ] || [ -z "$BETA" ] || [ -z "$SUSPEND" ]; then
+if [ -z "$SETUP" ] || [ -z "$BETA" ] || [ -z "$SUSPEND" ] || [ -z "$SUSPDEV" ] || [ -z "$SUSPDEVAL" ]; then
     echo "ERROR: Could not find symbols"
     nm -D libtolinom.so | grep nm_hook
     exit 1
@@ -54,6 +60,8 @@ fi
 sed -i "s|PLACEHOLDER_SETUP|$SETUP|" tolinom.cc
 sed -i "s|PLACEHOLDER_BETA|$BETA|" tolinom.cc
 sed -i "s|PLACEHOLDER_SUSPEND|$SUSPEND|" tolinom.cc
+sed -i "s|PLACEHOLDER_SUSPDEV|$SUSPDEV|" tolinom.cc
+sed -i "s|PLACEHOLDER_SUSPDEVAL|$SUSPDEVAL|" tolinom.cc
 rm -f *.o libtolinom.so
 
 arm-linux-gnueabihf-gcc -c -fPIC -Os nh.c -o nh.o 2>/dev/null

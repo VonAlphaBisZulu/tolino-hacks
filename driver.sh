@@ -17,12 +17,10 @@ ARCHIVE="$1"; STAGE="$2"
 case $STAGE in
   stage1)
 
-    # --- 0. Enable devmode (switch from release to dev branch) ---
-    if [ -f /etc/rootfs-branch ]; then
-        sed -i 's#release/#dev/#' /etc/rootfs-branch
-    elif [ -f /usr/local/Kobo/branch ]; then
-        sed -i 's#release/#dev/#' /usr/local/Kobo/branch
-    fi
+    # NOTE: we deliberately do NOT flip /etc/rootfs-branch to "dev/". Kobo's
+    # nickel enables a top-right debug HUD when running the dev rootfs, and
+    # we get no benefit from the dev branch — /etc mods, /home/root, /mnt/
+    # onboard and rc.local LD_PRELOAD all persist on the release branch too.
 
     # --- 1. Stage .adds/ files to /etc/tolino-hacks/ ---
     # /mnt/onboard/ may not be writable during the update process,
@@ -86,17 +84,6 @@ case "$1" in
             cp -n /etc/tolino-hacks/* /mnt/onboard/.adds/ 2>/dev/null
             chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
             chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
-        fi
-        # Disable the devmode debug overlay (HUD). We still need dev/
-        # rootfs branch for other features, but the overlay is purely
-        # visual and controlled by a separate Kobo eReader.conf setting.
-        CONF="/mnt/onboard/.kobo/Kobo/Kobo eReader.conf"
-        if [ -f "$CONF" ]; then
-            if grep -q '^DebugOverlay=' "$CONF"; then
-                sed -i 's/^DebugOverlay=.*/DebugOverlay=false/' "$CONF"
-            elif grep -q '^\[DeveloperSettings\]' "$CONF"; then
-                sed -i '/^\[DeveloperSettings\]/a DebugOverlay=false' "$CONF"
-            fi
         fi
         # SSH does NOT auto-start on boot — users would wonder why the
         # device never sleeps. Create /mnt/onboard/.adds/ssh-autostart as
