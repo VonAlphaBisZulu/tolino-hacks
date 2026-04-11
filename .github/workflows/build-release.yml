@@ -29,7 +29,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
 
-      - name: Build libtolinom.so
+      - name: Build libtolinom.so (public variant — no reverse tunnel)
+        env:
+          TOLINOM_PUBLIC: "1"
         run: bash build.sh "$GITHUB_WORKSPACE"
 
       - name: Build dropbearmulti
@@ -46,15 +48,21 @@ jobs:
 
       - name: Package update.tar (self-contained)
         run: |
-          # Build self-contained update.tar with everything embedded
+          # Build self-contained update.tar with everything embedded.
+          # The public release excludes the reverse-tunnel scripts and the
+          # .env example — those belong to the personal variant.
           STAGING=$(mktemp -d)
           cp driver.sh "$STAGING/"
           chmod +x "$STAGING/driver.sh"
           mkdir -p "$STAGING/.adds"
           cp libtolinom.so "$STAGING/.adds/"
           cp dropbearmulti "$STAGING/.adds/"
-          cp .env.example "$STAGING/.adds/"
-          cp scripts/*.sh "$STAGING/.adds/" 2>/dev/null || true
+          for f in scripts/*.sh; do
+            case "$(basename "$f")" in
+              cloud-*.sh) continue ;;
+              *) cp "$f" "$STAGING/.adds/" ;;
+            esac
+          done
           chmod +x "$STAGING/.adds/"*.sh "$STAGING/.adds/dropbearmulti"
           (cd "$STAGING" && tar cf "$GITHUB_WORKSPACE/update.tar" driver.sh .adds/)
           echo "update.tar contents:"

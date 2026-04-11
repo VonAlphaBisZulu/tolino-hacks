@@ -72,14 +72,39 @@ case $STAGE in
 #!/bin/sh
 case "$1" in
     start)
-        # On first boot after update, copy staged files to .adds/
+        # On first boot after update, copy staged files to .adds/.
+        # cp -n skips existing files so a user's hand-deployed libtolinom.so
+        # is never clobbered. Also restore the NickelHook failsafe rename
+        # if the previous boot left a stale .failsafe behind.
+        if [ -f /mnt/onboard/.adds/libtolinom.so.failsafe ] \
+           && [ ! -f /mnt/onboard/.adds/libtolinom.so ]; then
+            mv /mnt/onboard/.adds/libtolinom.so.failsafe \
+               /mnt/onboard/.adds/libtolinom.so
+        fi
         if [ -d /etc/tolino-hacks ] && [ -f /etc/tolino-hacks/dropbearmulti ]; then
             mkdir -p /mnt/onboard/.adds
             cp -n /etc/tolino-hacks/* /mnt/onboard/.adds/ 2>/dev/null
             chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
             chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
         fi
-        [ -f /mnt/onboard/.adds/ssh-start.sh ] && /mnt/onboard/.adds/ssh-start.sh
+        # Disable the devmode debug overlay (HUD). We still need dev/
+        # rootfs branch for other features, but the overlay is purely
+        # visual and controlled by a separate Kobo eReader.conf setting.
+        CONF="/mnt/onboard/.kobo/Kobo/Kobo eReader.conf"
+        if [ -f "$CONF" ]; then
+            if grep -q '^DebugOverlay=' "$CONF"; then
+                sed -i 's/^DebugOverlay=.*/DebugOverlay=false/' "$CONF"
+            elif grep -q '^\[DeveloperSettings\]' "$CONF"; then
+                sed -i '/^\[DeveloperSettings\]/a DebugOverlay=false' "$CONF"
+            fi
+        fi
+        # SSH does NOT auto-start on boot — users would wonder why the
+        # device never sleeps. Create /mnt/onboard/.adds/ssh-autostart as
+        # an empty flag file to opt into auto-start for your own device.
+        if [ -f /mnt/onboard/.adds/ssh-autostart ] \
+           && [ -f /mnt/onboard/.adds/ssh-start.sh ]; then
+            /mnt/onboard/.adds/ssh-start.sh
+        fi
         ;;
     stop)
         [ -f /mnt/onboard/.adds/ssh-stop.sh ] && /mnt/onboard/.adds/ssh-stop.sh

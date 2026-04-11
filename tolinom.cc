@@ -58,6 +58,7 @@ typedef void  (*show_t)(void*);                             // QWidget::show()
 // Original function pointers (set by NickelHook)
 static setupUi_t orig_setupUi = nullptr;
 static void_fn_t orig_betaFeatures = nullptr;
+static void_fn_t orig_suspend = nullptr;
 
 // Resolved Qt symbols
 static ctor_t     fn_btnCtor    = nullptr;
@@ -106,119 +107,233 @@ static void resolve_syms() {
 
 static void do_library_sync();
 
-static void show_scripts_dialog(void *moreview) {
-    dbglog("show_scripts_dialog");
-    if (!fn_dlgCtor || !fn_new || !fn_setTitle || !fn_show) {
+// Helper: convert ASCII string to char16_t buffer, return length.
+// Newlines are preserved — the dialog renders them as line breaks.
+static int ascii_to_u16(const char *src, char16_t *dst, int maxlen) {
+    int i = 0;
+    for (; src[i] && i < maxlen - 1; i++)
+        dst[i] = (char16_t)src[i];
+    return i;
+}
+
+// Helper: run command and capture first line of output
+static int run_capture(const char *cmd, char *buf, int buflen) {
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+    buf[0] = 0;
+    fgets(buf, buflen, p);
+    pclose(p);
+    // strip trailing newline
+    int n = strlen(buf);
+    if (n > 0 && buf[n-1] == '\n') buf[--n] = 0;
+    return n;
+}
+
+static void show_panel(void *parent) {
+    dbglog("show_panel");
+    if (!fn_dlgCtor || !fn_new || !fn_setTitle) {
         dbglog("missing dialog syms");
         return;
     }
 
-    // Create ConfirmationDialog (32KB: unknown real size, overallocate to be safe)
-    void *dlg = fn_new(32768);
-    if (!dlg) return;
-    fn_dlgCtor(dlg, (void*)moreview);
-
-    // Configure dialog
-    STACK_QS(title, u"Scripts", 7);
-    fn_setTitle(dlg, &title);
-    if (fn_showClose) fn_showClose(dlg, true);
-
-    // Use ConfirmationDialog's built-in accept button for each script
-    // Show sequential "Run X?" dialogs using exec() (blocking)
+    // Resolve symbols
     typedef void (*setText_t)(void*, const void*);
     typedef void (*setAccBtnText_t)(void*, const void*);
     typedef void (*setRejVisible_t)(void*, bool);
     typedef int  (*exec_t)(void*);
-    typedef void (*dlgDtor_t)(void*);
 
-    static setText_t      fn_setText     = nullptr;
-    static setAccBtnText_t fn_setAccBtn  = nullptr;
-    static setRejVisible_t fn_setRejVis  = nullptr;
-    static exec_t         fn_exec        = nullptr;
+    static setText_t       fn_setText    = nullptr;
+    static setAccBtnText_t fn_setAccBtn = nullptr;
+    static setRejVisible_t fn_setRejVis = nullptr;
+    static exec_t          fn_exec      = nullptr;
 
-    if (!fn_setText)    fn_setText    = (setText_t)     dlsym(RTLD_DEFAULT, "_ZN18ConfirmationDialog7setTextERK7QString");
-    if (!fn_setAccBtn)  fn_setAccBtn = (setAccBtnText_t)dlsym(RTLD_DEFAULT, "_ZN18ConfirmationDialog19setAcceptButtonTextERK7QString");
-    if (!fn_setRejVis)  fn_setRejVis = (setRejVisible_t)dlsym(RTLD_DEFAULT, "_ZN18ConfirmationDialog22setRejectButtonVisibleEb");
-    if (!fn_exec)       fn_exec      = (exec_t)        dlsym(RTLD_DEFAULT, "_ZN7QDialog4execEv");
+    if (!fn_setText)    fn_setText    = (setText_t)         dlsym(RTLD_DEFAULT, "_ZN18ConfirmationDialog7setTextERK7QString");
+    if (!fn_setAccBtn)  fn_setAccBtn = (setAccBtnText_t)   dlsym(RTLD_DEFAULT, "_ZN18ConfirmationDialog19setAcceptButtonTextERK7QString");
+    if (!fn_setRejVis)  fn_setRejVis = (setRejVisible_t)   dlsym(RTLD_DEFAULT, "_ZN18ConfirmationDialog22setRejectButtonVisibleEb");
+    if (!fn_exec)       fn_exec      = (exec_t)            dlsym(RTLD_DEFAULT, "_ZN7QDialog4execEv");
 
-    dbglog("setText=%p setAccBtn=%p setRejVis=%p exec=%p", fn_setText, fn_setAccBtn, fn_setRejVis, fn_exec);
-
-    struct { const char16_t *label; long len; const char *cmd;
-             const char16_t *desc; long dlen; } scripts[] = {
-        { u"SSH Start",       9, "/mnt/onboard/.adds/ssh-start.sh",
-          u"Start SSH server (port 2222)", 28 },
-        { u"SSH Stop",        8, "/mnt/onboard/.adds/ssh-stop.sh",
-          u"Stop SSH server", 15 },
-        { u"System Info",     11, "/mnt/onboard/.adds/sysinfo.sh &",
-          u"Save system information to sysinfo.txt", 38 },
-        { u"Refresh Library", 15, "__BUILTIN_REFRESH__",
-          u"Rescan books via PlugWorkflowManager", 36 },
-    };
-    int nscripts = 4;
-
-    if (fn_setText && fn_setAccBtn && fn_exec) {
-        for (int i = 0; i < nscripts; i++) {
-            void *d = fn_new(32768);
-            if (!d) continue;
-            fn_dlgCtor(d, (void*)moreview);
-
-            FakeQString t = {nullptr, (char16_t*)scripts[i].label, scripts[i].len};
-            fn_setTitle(d, &t);
-            FakeQString desc = {nullptr, (char16_t*)scripts[i].desc, scripts[i].dlen};
-            fn_setText(d, &desc);
-            STACK_QS(runText, u"Run", 3);
-            fn_setAccBtn(d, &runText);
-            if (fn_showClose) fn_showClose(d, true);
-            if (fn_setRejVis) fn_setRejVis(d, false);
-
-            dbglog("showing dialog for script[%d]", i);
-            int result = fn_exec(d);
-            dbglog("exec returned %d", result);
-
-            if (result == 1) { // QDialog::Accepted
-                dbglog("running: %s", scripts[i].cmd);
-                if (strcmp(scripts[i].cmd, "__BUILTIN_REFRESH__") == 0) {
-                    do_library_sync();
-                } else {
-                    system(scripts[i].cmd);
-                }
-
-                // Show status feedback if the script wrote a status file
-                {
-                    FILE *sf = fopen("/mnt/onboard/cloud-status.txt", "r");
-                    if (sf) {
-                        char sbuf[256] = {0};
-                        fgets(sbuf, sizeof(sbuf), sf);
-                        fclose(sf);
-                        // Convert to char16_t
-                        char16_t ubuf[256];
-                        int slen = 0;
-                        for (int j = 0; sbuf[j] && sbuf[j] != '\n' && j < 255; j++) {
-                            ubuf[j] = (char16_t)sbuf[j];
-                            slen++;
-                        }
-                        unlink("/mnt/onboard/cloud-status.txt");
-                        void *sd = fn_new(32768);
-                        if (sd) {
-                            fn_dlgCtor(sd, (void*)moreview);
-                            STACK_QS(stitle, u"Status", 6);
-                            fn_setTitle(sd, &stitle);
-                            FakeQString stext = {nullptr, ubuf, slen};
-                            fn_setText(sd, &stext);
-                            STACK_QS(okText, u"OK", 2);
-                            fn_setAccBtn(sd, &okText);
-                            if (fn_showClose) fn_showClose(sd, true);
-                            if (fn_setRejVis) fn_setRejVis(sd, false);
-                            fn_exec(sd);
-                        }
-                    }
-                }
-                break;
-            }
-            // If closed/rejected, show next option
-        }
+    if (!fn_exec || !fn_dlgAddWidget) {
+        dbglog("missing panel syms: exec=%p addW=%p", fn_exec, fn_dlgAddWidget);
+        return;
     }
-    dbglog("dialog sequence done");
+
+    for (;;) {
+        // --- Read current state ---
+        bool ssh_on = (system("pidof dropbearmulti >/dev/null 2>&1") == 0);
+        bool tunnel_on = (system("pidof dbclient >/dev/null 2>&1") == 0);
+
+        // Resolve SSH connection details (shown in the sub-label under the SSH row)
+        char sshInfo[256] = {0};
+        if (ssh_on) {
+            char ip[32] = {0};
+            char pw[32] = {0};
+            run_capture("ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2", ip, sizeof(ip));
+            run_capture(
+                "SERIAL=$(cat /mnt/onboard/.kobo/version 2>/dev/null | cut -d',' -f1);"
+                "MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null);"
+                "printf '%s' \"tolino-hacks-ssh:${SERIAL}:${MAC}\" | md5sum | cut -c1-12",
+                pw, sizeof(pw));
+            dbglog("panel: ip='%s' pw='%s' ssh_on=%d", ip, pw, ssh_on);
+            if (ip[0] && pw[0])
+                snprintf(sshInfo, sizeof(sshInfo),
+                    "ssh -p 2222 root@%s\nPassword: %s\nWiFi + wake-lock kept alive",
+                    ip, pw);
+            else if (ip[0])
+                snprintf(sshInfo, sizeof(sshInfo),
+                    "ssh -p 2222 root@%s\nWiFi + wake-lock kept alive", ip);
+            else
+                snprintf(sshInfo, sizeof(sshInfo), "on (no WiFi)");
+        } else {
+            snprintf(sshInfo, sizeof(sshInfo), "off");
+        }
+
+        const char *tunInfo = tunnel_on ? "connected" : "off";
+
+        // --- Build dialog ---
+        void *dlg = fn_new(32768);
+        if (!dlg) break;
+        fn_dlgCtor(dlg, parent);
+        STACK_QS(title, u"Tolino Hacks", 12);
+        fn_setTitle(dlg, &title);
+        if (fn_showClose) fn_showClose(dlg, true);
+        if (fn_setRejVis) fn_setRejVis(dlg, false);
+
+        // --- Toggle rows using native MenuTextItem (same widget as Mehr menu) ---
+        typedef void (*menuItemCtor_t)(void*, void*, bool, bool);
+        typedef void (*menuItemSetText_t)(void*, const void*);
+        typedef void (*menuItemRegGestures_t)(void*);
+        static menuItemCtor_t fn_miCtor = nullptr;
+        static menuItemSetText_t fn_miSetText = nullptr;
+        static menuItemRegGestures_t fn_miRegGest = nullptr;
+        static setRejVisible_t fn_setAccVis = nullptr;
+        if (!fn_miCtor)    fn_miCtor    = (menuItemCtor_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItemC1EP7QWidgetbb");
+        if (!fn_miSetText) fn_miSetText = (menuItemSetText_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItem7setTextERK7QString");
+        if (!fn_miRegGest) fn_miRegGest = (menuItemRegGestures_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItem22registerForTapGesturesEv");
+        if (!fn_setAccVis) fn_setAccVis = (setRejVisible_t)dlsym(RTLD_DEFAULT, "_ZN18ConfirmationDialog22setAcceptButtonVisibleEb");
+        if (!fn_miCtor) { dbglog("no MenuTextItem"); break; }
+
+        // Style override: remove italic/bold quirks, keep native layout
+        STACK_QS(miSS, u"*{font-style:normal;}", 21);
+
+        auto makeMenuRow = [&](const char16_t *text, int len, bool checkable, bool checked) -> void* {
+            void *w = fn_new(32768);
+            fn_miCtor(w, nullptr, checkable, checked);
+            FakeQString qs = {nullptr, (char16_t*)text, len};
+            fn_miSetText(w, &qs);
+            if (fn_setSS) fn_setSS(w, &miSS);
+            fn_dlgAddWidget(dlg, w);
+            // Register gestures AFTER the widget is parented into the dialog,
+            // otherwise the first tap is swallowed by focus/gesture bootstrap.
+            if (fn_miRegGest) fn_miRegGest(w);
+            return w;
+        };
+
+        // Sub-label rendered as a non-interactive TouchLabel under each row.
+        typedef void (*touchLblCtor_t)(void*, const void*, void*, int);
+        typedef void (*touchLblInit_t)(void*);
+        static touchLblCtor_t fn_touchCtor = nullptr;
+        static touchLblInit_t fn_touchInit = nullptr;
+        if (!fn_touchCtor) fn_touchCtor = (touchLblCtor_t)dlsym(RTLD_DEFAULT, "_ZN10TouchLabelC1ERK7QStringP7QWidget6QFlagsIN2Qt10WindowTypeEE");
+        if (!fn_touchInit) fn_touchInit = (touchLblInit_t)dlsym(RTLD_DEFAULT, "_ZN10TouchLabel10initializeEv");
+
+        STACK_QS(subSS,
+            u"QLabel{font-size:9pt;font-weight:300;color:#333;"
+             "padding:4px 48px 14px 48px;}",
+            76);
+
+        // Sub-label text buffers must outlive fn_exec(dlg), so they live in the
+        // loop iteration scope rather than inside the lambda (where stack reuse
+        // would leave Qt reading garbage and rendering it as CJK).
+        char16_t sshInfoU[256];
+        char16_t tunInfoU[256];
+        int sshInfoLen = ascii_to_u16(sshInfo, sshInfoU, 256);
+        int tunInfoLen = ascii_to_u16(tunInfo, tunInfoU, 256);
+        FakeQString sshInfoQS = {nullptr, sshInfoU, sshInfoLen};
+        FakeQString tunInfoQS = {nullptr, tunInfoU, tunInfoLen};
+
+        auto makeSubLabel = [&](const FakeQString *qs) {
+            if (!fn_touchCtor || qs->size == 0) return;
+            void *w = fn_new(32768);
+            fn_touchCtor(w, qs, nullptr, 0);
+            if (fn_touchInit) fn_touchInit(w);
+            if (fn_setSS) fn_setSS(w, &subSS);
+            fn_dlgAddWidget(dlg, w);
+        };
+
+        // Prefix toggle rows with a Unicode checkbox glyph so the state is obvious.
+        // ☑ = U+2611, ☐ = U+2610. Action rows get a refresh glyph.
+        void *sshTouch = makeMenuRow(
+            ssh_on ? u"\u2611  SSH Server" : u"\u2610  SSH Server", 13, false, false);
+        makeSubLabel(&sshInfoQS);
+
+#ifndef TOLINOM_PUBLIC
+        // Reverse tunnel is a personal-build feature — it needs a server the
+        // user controls. Public builds hide the row entirely.
+        void *tunTouch = makeMenuRow(
+            tunnel_on ? u"\u2611  Reverse Tunnel" : u"\u2610  Reverse Tunnel", 17, false, false);
+        makeSubLabel(&tunInfoQS);
+#else
+        void *tunTouch = nullptr;
+        (void)tunnel_on; (void)tunInfoQS;
+#endif
+
+        void *refreshTouch = makeMenuRow(
+            u"\u21BB  Refresh Library", 18, false, false);
+
+        // Hidden trackers — tap toggles tracker AND closes dialog.
+        // Slots for ssh / tunnel / refresh; the tunnel slot is nullptr in
+        // public builds and is simply skipped.
+        STACK_QS(emptyStr, u"", 0);
+        void *trackers[3] = {nullptr, nullptr, nullptr};
+        void *touches[3]  = {sshTouch, tunTouch, refreshTouch};
+        for (int i = 0; i < 3; i++) {
+            if (!touches[i]) continue;
+            trackers[i] = fn_new(32768);
+            fn_btnCtor(trackers[i], &emptyStr, nullptr);
+            fn_setCheckable(trackers[i], true);
+            FakeConnection ct = {nullptr};
+            fn_connect(&ct, touches[i], "2tapped(bool)", trackers[i], "1toggle()", 0);
+            FakeConnection ca = {nullptr};
+            fn_connect(&ca, touches[i], "2tapped(bool)", dlg, "1accept()", 0);
+        }
+
+        // Hide the accept button entirely (tapping rows auto-closes)
+        if (fn_setAccVis) fn_setAccVis(dlg, false);
+
+        // --- Show and wait ---
+        dbglog("panel: showing (ssh=%d tunnel=%d)", ssh_on, tunnel_on);
+        int result = fn_exec(dlg);
+        dbglog("panel: exec returned %d", result);
+
+        if (result != 1) break; // closed
+
+        // --- Apply: tracker checked = user tapped it (toggle from prior state) ---
+        if (trackers[0] && fn_isChecked(trackers[0])) {
+            if (ssh_on) {
+                dbglog("panel: stopping SSH");
+                system("/mnt/onboard/.adds/ssh-stop.sh");
+            } else {
+                dbglog("panel: starting SSH");
+                system("/mnt/onboard/.adds/ssh-start.sh");
+            }
+        }
+        if (trackers[1] && fn_isChecked(trackers[1])) {
+            if (tunnel_on) {
+                dbglog("panel: stopping tunnel");
+                system("/mnt/onboard/.adds/cloud-disconnect.sh");
+            } else {
+                dbglog("panel: starting tunnel");
+                system("/mnt/onboard/.adds/cloud-connect.sh &");
+            }
+        }
+        if (trackers[2] && fn_isChecked(trackers[2])) {
+            dbglog("panel: refreshing library");
+            do_library_sync();
+        }
+
+        // Loop back to show updated status
+    }
+    dbglog("panel closed");
 }
 
 // Hook: Ui_MoreView::setupUi - creates the Scripts button
@@ -233,35 +348,92 @@ void nm_hook_setupUi(void *_this, QWidget *widget) {
     void *layout = fn_layout(widget);
     if (!layout) { dbglog("no layout"); return; }
 
-    // Create Scripts button (32KB: we don't know the real object size, overallocate to be safe)
-    STACK_QS(label, u"Scripts", 7);
-    void *btn = fn_new(32768);
-    if (!btn) return;
-    fn_btnCtor(btn, &label, widget);
+    // Ui_MoreView struct (from uic):
+    // [0] moreViewLayout  [1] moreContainer  [2] moreContainerLayout
+    // [3..17] buttons (activity, articles, settings, help, betaFeatures, etc.)
+    void **ui = (void**)_this;
+    void *containerLayout = ui[2];
+    dbglog("containerLayout=%p", containerLayout);
 
-    // Style to match other MoreView buttons
-    if (fn_setFlat) fn_setFlat(btn, true);
-    if (fn_setSS) {
-        STACK_QS(ss, u"QPushButton { font-size: 13pt; text-align: left; padding: 15px 20px; border: none; border-bottom: 1px solid #c0c0c0; background: transparent; }", 149);
-        fn_setSS(btn, &ss);
+    // Create MenuTextItem — the native Kobo menu button widget
+    typedef void (*menuItemCtor_t)(void*, void*, bool, bool);
+    typedef void (*menuItemSetText_t)(void*, const void*);
+    typedef void (*menuItemRegGestures_t)(void*);
+    menuItemCtor_t fn_miCtor = (menuItemCtor_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItemC1EP7QWidgetbb");
+    menuItemSetText_t fn_miSetText = (menuItemSetText_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItem7setTextERK7QString");
+    menuItemRegGestures_t fn_miRegGest = (menuItemRegGestures_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItem22registerForTapGesturesEv");
+
+    if (!fn_miCtor) {
+        dbglog("no MenuTextItem constructor");
+        return;
     }
 
-    fn_addWidget(layout, btn, 0, 0);
+    void *btn = fn_new(32768);
+    if (!btn) return;
+    // MenuTextItem(QWidget* parent, bool checkable, bool checked)
+    fn_miCtor(btn, (void*)ui[1], false, false);
+    STACK_QS(label, u"Tolino Hacks", 12);
+    fn_miSetText(btn, &label);
+    if (fn_miRegGest) fn_miRegGest(btn);
 
-    // Make checkable (used as flag to detect our button in betaFeatures hook)
-    if (fn_setCheckable) fn_setCheckable(btn, true);
+    // Force non-italic font (MenuTextItem defaults to italic for some states)
+    if (fn_setSS) {
+        STACK_QS(css, u"*{font-style:normal;font-weight:normal;}", 41);
+        fn_setSS(btn, &css);
+    }
 
-    // Connect clicked(bool) -> setChecked(bool) to track state
+    // Append to moreContainerLayout (bottom of the list), wrapped in a
+    // little spacing so it's visually separated from the native items.
+    typedef void (*addSpacing_t)(void*, int);
+    addSpacing_t fn_addSpacing = (addSpacing_t)dlsym(RTLD_DEFAULT, "_ZN10QBoxLayout10addSpacingEi");
+
+    // QFrame separator below the button
+    typedef void (*qframeCtor_t)(void*, void*, int);
+    typedef void (*setFrameShape_t)(void*, int);
+    qframeCtor_t fn_frameCtor = (qframeCtor_t)dlsym(RTLD_DEFAULT, "_ZN6QFrameC1EP7QWidget6QFlagsIN2Qt10WindowTypeEE");
+    setFrameShape_t fn_setShape = (setFrameShape_t)dlsym(RTLD_DEFAULT, "_ZN6QFrame13setFrameShapeENS_5ShapeE");
+
+    void *targetLayout = (containerLayout && fn_addWidget) ? containerLayout : layout;
+    if (fn_addSpacing) fn_addSpacing(targetLayout, 18);
+    fn_addWidget(targetLayout, btn, 0, 0);
+    if (fn_addSpacing) fn_addSpacing(targetLayout, 18);
+
+    if (fn_frameCtor && fn_setShape) {
+        typedef void (*setFrameShadow_t2)(void*, int);
+        typedef void (*setLineWidth_t)(void*, int);
+        setFrameShadow_t2 fn_setShadow = (setFrameShadow_t2)dlsym(RTLD_DEFAULT, "_ZN6QFrame14setFrameShadowENS_6ShadowE");
+        setLineWidth_t    fn_setLW     = (setLineWidth_t)   dlsym(RTLD_DEFAULT, "_ZN6QFrame12setLineWidthEi");
+        void *sep = fn_new(2048);
+        if (sep) {
+            fn_frameCtor(sep, (void*)ui[1], 0);
+            fn_setShape(sep, 4); // QFrame::HLine
+            if (fn_setShadow) fn_setShadow(sep, 16); // QFrame::Plain
+            if (fn_setLW)     fn_setLW(sep, 2);
+            if (fn_setSS) {
+                STACK_QS(sepCss, u"QFrame{color:#888;margin:0 24px;}", 33);
+                fn_setSS(sep, &sepCss);
+            }
+            fn_addWidget(targetLayout, sep, 0, 0);
+        }
+    }
+
+    // Hidden QPushButton shim — bridges MenuTextItem::tapped to betaFeatures signal
+    // (Same pattern NickelMenu uses)
+    STACK_QS(emptyStr, u"", 0);
+    void *shim = fn_new(32768);
+    fn_btnCtor(shim, &emptyStr, widget);
+    fn_setCheckable(shim, true);
+
+    // MenuTextItem::tapped(bool) -> shim::toggle()
     FakeConnection conn = {nullptr};
-    fn_connect(&conn, btn, "2clicked(bool)", btn, "1setChecked(bool)", 0);
+    fn_connect(&conn, btn, "2tapped(bool)", shim, "1toggle()", 0);
 
-    // Connect clicked() -> MoreView::betaFeatures() signal (signal-to-signal relay)
-    // betaFeatures() is a SIGNAL on MoreView (prefix "2"), not a SLOT (prefix "1")
+    // shim::toggled(bool) -> MoreView::betaFeatures() signal
     FakeConnection conn2 = {nullptr};
-    fn_connect(&conn2, btn, "2clicked()", widget, "2betaFeatures()", 0);
-    dbglog("btn=%p sig-to-sig betaFeatures on %p: %p", btn, widget, conn2.d_ptr);
+    fn_connect(&conn2, shim, "2toggled(bool)", widget, "2betaFeatures()", 0);
+    dbglog("MenuTextItem=%p shim=%p betaFeatures on %p", btn, shim, widget);
 
-    g_scriptsBtn = btn;
+    g_scriptsBtn = shim;  // track the shim, not the MenuTextItem
 }
 
 // Hook: MoreView::betaFeatures - intercept when Scripts button triggers it
@@ -272,19 +444,43 @@ void nm_hook_betaFeatures(void *_this) {
     // Check if triggered by our Scripts button
     if (g_scriptsBtn && fn_isChecked && fn_isChecked(g_scriptsBtn)) {
         dbglog("triggered by Scripts button!");
-        // Uncheck the button
+        // Uncheck the shim — but block signals first so resetting
+        // doesn't fire toggled(false) → betaFeatures() → real Beta dialog
+        typedef bool (*blockSig_t)(void*, bool);
         typedef void (*setChecked_t)(void*, bool);
+        blockSig_t fn_block = (blockSig_t)dlsym(RTLD_DEFAULT, "_ZN7QObject12blockSignalsEb");
         setChecked_t fn_sc = (setChecked_t)dlsym(RTLD_DEFAULT, "_ZN15QAbstractButton10setCheckedEb");
+        bool prev = false;
+        if (fn_block) prev = fn_block(g_scriptsBtn, true);
         if (fn_sc) fn_sc(g_scriptsBtn, false);
+        if (fn_block) fn_block(g_scriptsBtn, prev);
 
         // Show our custom dialog
-        show_scripts_dialog(_this);
+        show_panel(_this);
         return;
     }
 
     // Not our button - call original betaFeatures
     dbglog("calling original betaFeatures");
     orig_betaFeatures(_this);
+}
+
+// Hook: PowerManager::suspend — block it while SSH is active so the
+// device doesn't soft-sleep and drop the WiFi/SSH listener. ssh-start.sh
+// touches /tmp/tolinom-keepawake; ssh-stop.sh removes it.
+__attribute__((visibility("default")))
+void nm_hook_suspend(void *_this) {
+    if (access("/tmp/tolinom-keepawake", F_OK) == 0) {
+        dbglog("suspend blocked — keepawake flag set");
+        // Reset the idle timer so nickel doesn't loop-retry immediately.
+        typedef void (*upd_t)(void*);
+        static upd_t fn_upd = nullptr;
+        if (!fn_upd) fn_upd = (upd_t)dlsym(RTLD_DEFAULT,
+            "_ZN12PowerManager14updateLastUsedEv");
+        if (fn_upd) fn_upd(_this);
+        return;
+    }
+    if (orig_suspend) orig_suspend(_this);
 }
 
 // Trigger file: MCP or shell scripts can create this to request a library sync
@@ -375,7 +571,7 @@ static void *poll_thread(void *) {
 }
 
 static int nm_init(){
-    dbglog("init v5 (thread-safe sync)");
+    dbglog("init v6 (panel UI)");
     if(!access("/mnt/onboard/.adds/tolinom.disabled",F_OK)){dbglog("disabled");return 1;}
     dbglog("orig_setupUi=%p orig_betaFeatures=%p", orig_setupUi, orig_betaFeatures);
 
@@ -386,7 +582,7 @@ static int nm_init(){
     return 0;
 }
 
-static struct nh_info info={.name="TolinoM",.desc="Scripts menu v5",.failsafe_delay=15};
+static struct nh_info info={.name="TolinoM",.desc="Panel UI v6",.failsafe_delay=15};
 static struct nh_hook hooks[]={
     {
         .sym="_ZN11Ui_MoreView7setupUiEP7QWidget",
@@ -400,6 +596,13 @@ static struct nh_hook hooks[]={
         .sym_new="PLACEHOLDER_BETA",
         .lib="libnickel.so.1.0.0",
         .out=(void**)&orig_betaFeatures,
+        .optional=true,
+    },
+    {
+        .sym="_ZN12PowerManager7suspendEv",
+        .sym_new="PLACEHOLDER_SUSPEND",
+        .lib="libnickel.so.1.0.0",
+        .out=(void**)&orig_suspend,
         .optional=true,
     },
     {0}
