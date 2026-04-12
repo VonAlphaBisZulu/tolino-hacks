@@ -19,6 +19,17 @@ static int g_scriptBtnCount = 0;
 static pthread_t g_pollThread;
 static bool g_pollRunning = false;
 
+// Panel auto-refresh: set when the Tolino Hacks dialog is being exec()'d,
+// cleared when it returns. The poll thread samples wifi/ssh/tunnel state
+// periodically and, if anything changes while the dialog is open, queues
+// QDialog::accept() on the main thread so the panel's for-loop rebuilds
+// it with fresh data. Users no longer see a stale "SSH connectable" row
+// after the WiFi drops.
+static void * volatile g_panelDlg = nullptr;
+static char g_panelIp[32] = {0};
+static int  g_panelSsh   = 0;
+static int  g_panelTun   = 0;
+
 struct QWidget;
 
 static FILE *dbg=nullptr;
@@ -165,17 +176,28 @@ static void show_panel(void *parent) {
         // dbclient runs via the dropbearmulti multi-call binary, so argv[0]
         // is "dropbearmulti" and pidof dbclient never matches. Detect both
         // the server and the tunnel client by full command line match.
+        // The `[d]` character-class trick stops pgrep from matching the
+        // parent shell that system() spawns (its cmdline contains the
+        // literal pattern string).
         bool ssh_on = (system(
-            "pgrep -f 'dropbearmulti dropbear' >/dev/null 2>&1") == 0);
+            "pgrep -f '[d]ropbearmulti dropbear' >/dev/null 2>&1") == 0);
         bool tunnel_on = (system(
-            "pgrep -f 'dropbearmulti dbclient' >/dev/null 2>&1") == 0);
+            "pgrep -f '[d]ropbearmulti dbclient' >/dev/null 2>&1") == 0);
+
+        // Always read the IP so we can detect WiFi dropping mid-dialog.
+        char ip[32] = {0};
+        run_capture("ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2", ip, sizeof(ip));
+
+        // Snapshot for the poll thread auto-refresh watchdog
+        strncpy(g_panelIp, ip, sizeof(g_panelIp) - 1);
+        g_panelIp[sizeof(g_panelIp) - 1] = 0;
+        g_panelSsh = ssh_on ? 1 : 0;
+        g_panelTun = tunnel_on ? 1 : 0;
 
         // Resolve SSH connection details (shown in the sub-label under the SSH row)
         char sshInfo[256] = {0};
         if (ssh_on) {
-            char ip[32] = {0};
             char pw[32] = {0};
-            run_capture("ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2", ip, sizeof(ip));
             run_capture(
                 "SERIAL=$(cat /mnt/onboard/.kobo/version 2>/dev/null | cut -d',' -f1);"
                 "MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null);"
@@ -312,7 +334,7 @@ static void show_panel(void *parent) {
 
         // WiFi reconnect action (useful after nickel drops the radio on sleep).
         void *wifiTouch = makeMenuRow(
-            u"\u21BB  Reconnect WiFi", 18, false, false);
+            u"\u21BB  Reconnect WiFi", 17, false, false);
 
         // Hidden trackers — tap toggles tracker AND closes dialog.
         // Slots for ssh / tunnel / refresh / wifi; the tunnel slot is nullptr
@@ -335,8 +357,11 @@ static void show_panel(void *parent) {
         if (fn_setAccVis) fn_setAccVis(dlg, false);
 
         // --- Show and wait ---
+        // Expose dlg to the poll thread so it can auto-close on state change.
+        g_panelDlg = dlg;
         dbglog("panel: showing (ssh=%d tunnel=%d)", ssh_on, tunnel_on);
         int result = fn_exec(dlg);
+        g_panelDlg = nullptr;
         dbglog("panel: exec returned %d", result);
 
         if (result != 1) break; // closed
@@ -617,6 +642,7 @@ static void do_library_sync_queued() {
 static void *poll_thread(void *) {
     typedef void (*setChecked_t)(void*, bool);
     setChecked_t fn_sc = nullptr;
+    int panel_watchdog_counter = 0;
     while (g_pollRunning) {
         usleep(150000); // 150ms
         // Check for sync trigger from MCP/shell (always, even before syms resolved)
@@ -625,6 +651,36 @@ static void *poll_thread(void *) {
             unlink(SYNC_TRIGGER);
             do_library_sync_queued();
         }
+
+        // Panel auto-refresh watchdog. Every ~3s while the panel is visible,
+        // resample wifi/ssh/tunnel state. If anything changed since the panel
+        // snapshot, queue dlg->accept() on the main thread and clear g_panelDlg
+        // so we don't fire twice. The panel's for-loop then re-reads state and
+        // rebuilds the dialog with fresh info.
+        if (g_panelDlg && ++panel_watchdog_counter >= 20) {
+            panel_watchdog_counter = 0;
+            char ip_now[32] = {0};
+            run_capture(
+                "ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2",
+                ip_now, sizeof(ip_now));
+            int ssh_now = (system("pgrep -f '[d]ropbearmulti dropbear' >/dev/null 2>&1") == 0) ? 1 : 0;
+            int tun_now = (system("pgrep -f '[d]ropbearmulti dbclient' >/dev/null 2>&1") == 0) ? 1 : 0;
+            if (ssh_now != g_panelSsh || tun_now != g_panelTun
+                || strncmp(ip_now, g_panelIp, sizeof(g_panelIp)) != 0) {
+                void *dlg = g_panelDlg;
+                g_panelDlg = nullptr;
+                typedef void (*singleShot_t)(int, const void*, const char*);
+                static singleShot_t fn_ss = nullptr;
+                if (!fn_ss) fn_ss = (singleShot_t)dlsym(RTLD_DEFAULT,
+                    "_ZN6QTimer10singleShotEiPK7QObjectPKc");
+                if (fn_ss && dlg) {
+                    dbglog("panel: state changed (ip='%s'->'%s' ssh=%d->%d tun=%d->%d), refreshing",
+                        g_panelIp, ip_now, g_panelSsh, ssh_now, g_panelTun, tun_now);
+                    fn_ss(0, dlg, "1accept()");
+                }
+            }
+        }
+
         if (!fn_isChecked) continue;
         if (!fn_sc) fn_sc = (setChecked_t)dlsym(RTLD_DEFAULT, "_ZN15QAbstractButton10setCheckedEb");
         for (int i = 0; i < g_scriptBtnCount; i++) {
