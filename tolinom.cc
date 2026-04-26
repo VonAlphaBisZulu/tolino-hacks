@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include "NickelHook.h"
 
 // Script button tracking for pthread-based click detection
@@ -40,6 +42,167 @@ static void dbglog(const char *fmt,...){
     if(!dbg)return;
     va_list ap;va_start(ap,fmt);vfprintf(dbg,fmt,ap);va_end(ap);
     fputc('\n',dbg);fflush(dbg);
+}
+
+// --- EPDC ioctl tracer ---
+// Logs every ioctl that nickel sends to a framebuffer fd. We track which
+// fds map to fb* via an open() hook; for those, we dump (request, region,
+// waveform, flags) to a separate trace file. Goal: discover what waveform
+// modes nickel uses for the keyboard vs the browser vs other widgets,
+// so we can replicate them in our QWebEngineView.
+//
+// To enable: touch /mnt/onboard/.adds/tolinom-epdc-trace before booting.
+// Disable by removing the file (we re-check on every ioctl — cheap).
+static FILE *epdc_log = nullptr;
+static int   epdc_fbfds[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
+
+static bool epdc_tracing() {
+    return access("/mnt/onboard/.adds/tolinom-epdc-trace", F_OK) == 0;
+}
+
+static void epdc_logf(const char *fmt, ...) {
+    if (!epdc_log) epdc_log = fopen("/mnt/onboard/tolinom-epdc.log", "a");
+    if (!epdc_log) return;
+    va_list ap; va_start(ap, fmt); vfprintf(epdc_log, fmt, ap); va_end(ap);
+    fputc('\n', epdc_log); fflush(epdc_log);
+}
+
+// Cache: fd → (is_fb_yes, is_fb_no, unknown). nickel opens /dev/fb0 before
+// our preload lib is loaded, so we can't catch the open() call. Instead,
+// the first time we see ioctl on an unknown fd, readlink(/proc/self/fd/N)
+// to discover what it points at and remember.
+static signed char fdkind[1024]; // 0=unknown, 1=fb, -1=not-fb
+
+static bool is_fb_fd(int fd) {
+    if (fd < 0 || fd >= 1024) return false;
+    if (fdkind[fd] == 1) return true;
+    if (fdkind[fd] == -1) return false;
+    char link[64], target[128];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, target, sizeof(target) - 1);
+    if (n <= 0) { fdkind[fd] = -1; return false; }
+    target[n] = 0;
+    bool fb = (strncmp(target, "/dev/fb", 7) == 0);
+    fdkind[fd] = fb ? 1 : -1;
+    return fb;
+}
+static void register_fb_fd(int fd) { if (fd >= 0 && fd < 1024) fdkind[fd] = 1; }
+static void unregister_fb_fd(int fd) { if (fd >= 0 && fd < 1024) fdkind[fd] = 0; }
+
+// Layout of the Linux/MXC mxcfb_update_data struct used by Kobo's EPDC.
+// First fields are stable across versions: rect (x,y,w,h) then waveform_mode,
+// update_mode, update_marker, temp, flags. We only read these.
+struct EpdcRect { unsigned int x, y, w, h; };
+struct EpdcUpdateData {
+    EpdcRect     update_region;
+    unsigned int waveform_mode;
+    unsigned int update_mode;
+    unsigned int update_marker;
+    int          temp;
+    unsigned int flags;
+    // (more fields after, ignored)
+};
+
+// Symbolic names for the well-known waveforms — Kobo uses these on top of
+// the base mxc_epdc set. Order matches the driver enum.
+static const char *waveform_name(unsigned int wf) {
+    switch (wf) {
+        case 0: return "INIT";
+        case 1: return "DU";
+        case 2: return "GC16";
+        case 3: return "GC4";
+        case 4: return "A2";
+        case 5: return "GL16";
+        case 6: return "REAGL";
+        case 7: return "REAGLD";
+        case 257: return "AUTO"; // Kobo-specific MXCFB_WAVEFORM_MODE_AUTO
+        default: return "?";
+    }
+}
+
+extern "C" int open(const char *pathname, int flags, ...) {
+    static int (*real_open)(const char *, int, ...) = nullptr;
+    if (!real_open) real_open = (int(*)(const char *, int, ...))dlsym(RTLD_NEXT, "open");
+    int fd;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode_t mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+        fd = real_open(pathname, flags, mode);
+    } else {
+        fd = real_open(pathname, flags);
+    }
+    if (fd >= 0 && pathname && strncmp(pathname, "/dev/fb", 7) == 0) {
+        register_fb_fd(fd);
+        if (epdc_tracing()) epdc_logf("OPEN fb fd=%d path=%s", fd, pathname);
+    }
+    return fd;
+}
+
+extern "C" int close(int fd) {
+    static int (*real_close)(int) = nullptr;
+    if (!real_close) real_close = (int(*)(int))dlsym(RTLD_NEXT, "close");
+    if (is_fb_fd(fd)) unregister_fb_fd(fd);
+    return real_close(fd);
+}
+
+// Set when our QDialog (Apps) is visible, so we only rewrite waveforms
+// during app interaction — not during normal Tolino UI use.
+static volatile int g_app_active = 0;
+static bool epdc_fast_mode() {
+    return access("/mnt/onboard/.adds/tolinom-epdc-fast", F_OK) == 0;
+}
+
+// 0x4024462e = MXCFB_SEND_UPDATE on this driver (verified via trace).
+// Type='F' (0x46), nr=0x2e, write, size=36 bytes (matches our struct).
+#define KOBO_MXCFB_SEND_UPDATE 0x4024462eUL
+
+extern "C" int ioctl(int fd, unsigned long request, ...) {
+    static int (*real_ioctl)(int, unsigned long, ...) = nullptr;
+    if (!real_ioctl) real_ioctl = (int(*)(int, unsigned long, ...))dlsym(RTLD_NEXT, "ioctl");
+    va_list ap; va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+
+    if (is_fb_fd(fd) && request == KOBO_MXCFB_SEND_UPDATE && arg) {
+        EpdcUpdateData *u = (EpdcUpdateData *)arg;
+
+        // While our app dialog is on screen, downgrade heavy waveforms
+        // (GC16, REAGL) to DU so partial paints don't trigger the
+        // multi-flash full refresh. INIT and AUTO are left alone — INIT
+        // is only sent rarely (first paint) and AUTO is already adaptive.
+        if (g_app_active && epdc_fast_mode()) {
+            unsigned int orig_wf   = u->waveform_mode;
+            unsigned int orig_mode = u->update_mode;
+            // DU (1) is 2-bit fast partial; switch heavy waveforms to it.
+            if (orig_wf == 2 /*GC16*/ || orig_wf == 6 /*REAGL*/) {
+                u->waveform_mode = 1; // DU
+            }
+            // The flash comes from update_mode=1 (UPDATE_MODE_FULL) which
+            // drives the EPDC through a complete waveform cycle (clear +
+            // redraw). Force PARTIAL so the controller skips the cleanup
+            // pass — that's what kills the visible flicker.
+            if (u->update_mode == 1) u->update_mode = 0;
+            if (epdc_tracing() && (orig_wf != u->waveform_mode || orig_mode != u->update_mode))
+                epdc_logf("REWRITE wf %u(%s)->%u(%s) mode %u->%u region=(%u,%u %ux%u)",
+                    orig_wf, waveform_name(orig_wf),
+                    u->waveform_mode, waveform_name(u->waveform_mode),
+                    orig_mode, u->update_mode,
+                    u->update_region.x, u->update_region.y,
+                    u->update_region.w, u->update_region.h);
+        }
+
+        if (epdc_tracing()) {
+            epdc_logf("UPDATE fd=%d region=(%u,%u %ux%u) wf=%u(%s) mode=%u flags=0x%x app=%d",
+                fd,
+                u->update_region.x, u->update_region.y,
+                u->update_region.w, u->update_region.h,
+                u->waveform_mode, waveform_name(u->waveform_mode),
+                u->update_mode, u->flags, g_app_active);
+        }
+    }
+
+    return real_ioctl(fd, request, arg);
 }
 
 // Qt6 QString: { QArrayData* d, char16_t* ptr, qsizetype size }
@@ -299,7 +462,9 @@ static void show_webapp(void *parent, const char *index_path,
     if (fn_setGeo) fn_setGeo(dlg, &geo);
 
     dbglog("apps: launching %s -> %s", display_name, urlBuf);
+    g_app_active = 1;
     fn_exec_local(dlg);
+    g_app_active = 0;
     dbglog("apps: closed %s", display_name);
 }
 
