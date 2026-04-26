@@ -96,6 +96,15 @@ case "$1" in
             chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
             chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
         fi
+        # Default-enable the EPDC fast-mode override so the Apps WebView
+        # paints without the full EPDC clear+redraw flash. Users can
+        # remove this flag file to revert to GC16 / FULL behavior.
+        # Marker file (epdc-fast-default-set) records that we set it
+        # initially, so a manual `rm` sticks across reboots.
+        if [ ! -f /mnt/onboard/.adds/epdc-fast-default-set ]; then
+            touch /mnt/onboard/.adds/tolinom-epdc-fast
+            touch /mnt/onboard/.adds/epdc-fast-default-set
+        fi
         # SSH does NOT auto-start on boot — users would wonder why the
         # device never sleeps. Create /mnt/onboard/.adds/ssh-autostart as
         # an empty flag file to opt into auto-start for your own device.
