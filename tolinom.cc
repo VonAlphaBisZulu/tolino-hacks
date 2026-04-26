@@ -6,6 +6,8 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "NickelHook.h"
 
 // Script button tracking for pthread-based click detection
@@ -94,6 +96,7 @@ static setQS_t  fn_setObjNameQS = nullptr;
 
 // Global state
 static void *g_scriptsBtn = nullptr;
+static void *g_appsBtn    = nullptr;
 
 static void resolve_syms() {
     if (fn_btnCtor) return;
@@ -143,6 +146,241 @@ static int run_capture(const char *cmd, char *buf, int buflen) {
     return n;
 }
 
+// QUrl on the stack — d_ptr starts null, the C1Ev ctor allocates the
+// internal data. We never destruct it (small leak, scope-bounded use).
+struct FakeQUrl { void *d; };
+
+// QRect is x1,y1,x2,y2 (inclusive). All header-only inline ctors so we
+// build it ourselves.
+struct FakeQRect { int x1, y1, x2, y2; };
+
+// Show a single web app full-screen in a frameless QDialog hosting a
+// QWebEngineView. The HTML inside is responsible for its own chrome
+// (header, X close, etc.). Closing happens when the page calls
+// window.close() — we intercept windowCloseRequested and accept().
+static void show_webapp(void *parent, const char *index_path,
+                        const char *display_name) {
+    // Resolve symbols lazily so that even devices without QtWebEngine in
+    // memory degrade gracefully (the panel just won't open the app).
+    typedef void (*viewCtor_t)(void*, void*);
+    typedef void (*viewSetUrl_t)(void*, const FakeQUrl*);
+    typedef void (*urlCtor_t)(FakeQUrl*);
+    typedef void (*urlSetUrl_t)(FakeQUrl*, const void*, int);
+    typedef void (*resizeFn_t)(void*, int, int);
+    static viewCtor_t   fn_viewCtor   = nullptr;
+    static viewSetUrl_t fn_viewSetUrl = nullptr;
+    static urlCtor_t    fn_urlCtor    = nullptr;
+    static urlSetUrl_t  fn_urlSetUrl  = nullptr;
+    static resizeFn_t   fn_resize     = nullptr;
+    if (!fn_viewCtor)   fn_viewCtor   = (viewCtor_t)  dlsym(RTLD_DEFAULT, "_ZN14QWebEngineViewC1EP7QWidget");
+    if (!fn_viewSetUrl) fn_viewSetUrl = (viewSetUrl_t)dlsym(RTLD_DEFAULT, "_ZN14QWebEngineView6setUrlERK4QUrl");
+    if (!fn_urlCtor)    fn_urlCtor    = (urlCtor_t)   dlsym(RTLD_DEFAULT, "_ZN4QUrlC1Ev");
+    if (!fn_urlSetUrl)  fn_urlSetUrl  = (urlSetUrl_t) dlsym(RTLD_DEFAULT, "_ZN4QUrl6setUrlERK7QStringNS_11ParsingModeE");
+    if (!fn_resize)     fn_resize     = (resizeFn_t)  dlsym(RTLD_DEFAULT, "_ZN7QWidget6resizeEii");
+    if (!fn_viewCtor || !fn_viewSetUrl || !fn_urlCtor || !fn_urlSetUrl) {
+        dbglog("apps: QtWebEngine symbols missing");
+        return;
+    }
+
+    typedef int  (*exec_t)(void*);
+    typedef void (*qDialogCtor_t)(void*, void*, int);
+    typedef void (*qVBoxCtor_t)(void*, void*);
+    typedef void (*layAddW_t)(void*, void*);
+    typedef void (*layMargins_t)(void*, int, int, int, int);
+    typedef void (*setGeo_t)(void*, const FakeQRect*);
+    static exec_t        fn_exec_local = nullptr;
+    static qDialogCtor_t fn_qDlgCtor   = nullptr;
+    static qVBoxCtor_t   fn_vboxCtor   = nullptr;
+    static layAddW_t     fn_layAddW    = nullptr;
+    static layMargins_t  fn_layMargins = nullptr;
+    static setGeo_t      fn_setGeo     = nullptr;
+    if (!fn_exec_local) fn_exec_local = (exec_t)dlsym(RTLD_DEFAULT, "_ZN7QDialog4execEv");
+    if (!fn_qDlgCtor)   fn_qDlgCtor   = (qDialogCtor_t)dlsym(RTLD_DEFAULT, "_ZN7QDialogC1EP7QWidget6QFlagsIN2Qt10WindowTypeEE");
+    if (!fn_vboxCtor)   fn_vboxCtor   = (qVBoxCtor_t)dlsym(RTLD_DEFAULT, "_ZN11QVBoxLayoutC1EP7QWidget");
+    // QBoxLayout::addWidget(QWidget*) (no stretch/align overload) — actually
+    // we'll reuse the existing fn_addWidget which is the 4-arg overload.
+    if (!fn_layMargins) fn_layMargins = (layMargins_t)dlsym(RTLD_DEFAULT, "_ZN7QLayout18setContentsMarginsEiiii");
+    if (!fn_setGeo)     fn_setGeo     = (setGeo_t)dlsym(RTLD_DEFAULT, "_ZN7QWidget11setGeometryERK5QRect");
+    if (!fn_qDlgCtor || !fn_vboxCtor || !fn_exec_local) {
+        dbglog("apps: QDialog/QVBox symbols missing");
+        return;
+    }
+
+    // Build the file:// URL
+    char urlBuf[512];
+    snprintf(urlBuf, sizeof(urlBuf), "file://%s", index_path);
+    char16_t urlU[512];
+    int urlLen = ascii_to_u16(urlBuf, urlU, 512);
+    FakeQString urlQS = {nullptr, urlU, urlLen};
+
+    FakeQUrl url = {nullptr};
+    fn_urlCtor(&url);
+    fn_urlSetUrl(&url, &urlQS, 0);
+
+    (void)display_name;
+
+    // Frameless modal QDialog (no title bar, no chrome, no padding).
+    // Qt::FramelessWindowHint = 0x00000800.
+    void *dlg = fn_new(32768);
+    if (!dlg) return;
+    fn_qDlgCtor(dlg, parent, 0x00000800);
+
+    // QVBoxLayout that owns the dialog's layout slot.
+    void *layout = fn_new(2048);
+    if (layout) fn_vboxCtor(layout, dlg);
+    if (layout && fn_layMargins) fn_layMargins(layout, 0, 0, 0, 0);
+
+    // QWebEngineView fills the layout.
+    void *view = fn_new(131072);
+    if (!view) return;
+    fn_viewCtor(view, nullptr);
+
+    // Disable Chromium context menu — long-press on touch fires it,
+    // and "Open in new window" creates orphan top-level windows.
+    typedef void (*setCtxPolicy_t)(void*, int);
+    static setCtxPolicy_t fn_setCtxPolicy = nullptr;
+    if (!fn_setCtxPolicy) fn_setCtxPolicy = (setCtxPolicy_t)dlsym(RTLD_DEFAULT,
+        "_ZN7QWidget20setContextMenuPolicyEN2Qt17ContextMenuPolicyE");
+    if (fn_setCtxPolicy) fn_setCtxPolicy(view, 0); // Qt::NoContextMenu
+
+    fn_viewSetUrl(view, &url);
+
+    if (layout && fn_addWidget) fn_addWidget(layout, view, 1, 0);
+
+    // Wire JS window.close() to dlg.accept() via QWebEnginePage signal.
+    typedef void* (*pageGetter_t)(const void*);
+    static pageGetter_t fn_page = nullptr;
+    if (!fn_page) fn_page = (pageGetter_t)dlsym(RTLD_DEFAULT, "_ZNK14QWebEngineView4pageEv");
+    if (fn_page && fn_connect) {
+        void *page = fn_page(view);
+        if (page) {
+            FakeConnection wc = {nullptr};
+            fn_connect(&wc, page, "2windowCloseRequested()", dlg, "1accept()", 0);
+        }
+    }
+
+    // Native overlay close button — Chromium's window.close() is unreliable
+    // for non-script-opened windows, so we provide a Qt-side X that always
+    // works. Positioned absolute top-right above the WebView; raise()
+    // pulls it on top of the layout-managed view.
+    void *closeBtn = fn_new(8192);
+    if (closeBtn && fn_btnCtor) {
+        STACK_QS(xText, u"✕", 1); // ✕ multiplication X
+        fn_btnCtor(closeBtn, &xText, (QWidget*)dlg);
+        if (fn_setSS) {
+            STACK_QS(xCss,
+                u"QPushButton{background:#fff;border:2px solid #000;"
+                 "border-radius:30px;font-size:36px;font-weight:300;"
+                 "color:#000;}"
+                 "QPushButton:pressed{background:#000;color:#fff;}",
+                157);
+            fn_setSS(closeBtn, &xCss);
+        }
+        if (fn_resize) fn_resize(closeBtn, 60, 60);
+        // setGeometry on the button via QRect to position top-right
+        FakeQRect btnGeo = {1072 - 76, 16, 1072 - 17, 75};
+        if (fn_setGeo) fn_setGeo(closeBtn, &btnGeo);
+        // Raise above the WebView so taps hit the button, not the page
+        typedef void (*raise_t)(void*);
+        static raise_t fn_raise = nullptr;
+        if (!fn_raise) fn_raise = (raise_t)dlsym(RTLD_DEFAULT, "_ZN7QWidget5raiseEv");
+        if (fn_raise) fn_raise(closeBtn);
+        // Wire clicked → dlg.accept()
+        FakeConnection cb = {nullptr};
+        fn_connect(&cb, closeBtn, "2clicked(bool)", dlg, "1accept()", 0);
+        dbglog("apps: native close button wired");
+    }
+
+    // Position and size: full e-paper display, top-left corner. QRect uses
+    // inclusive (x1,y1,x2,y2) so right/bottom are size-1.
+    const int SCREEN_W = 1072;
+    const int SCREEN_H = 1448;
+    FakeQRect geo = {0, 0, SCREEN_W - 1, SCREEN_H - 1};
+    if (fn_setGeo) fn_setGeo(dlg, &geo);
+
+    dbglog("apps: launching %s -> %s", display_name, urlBuf);
+    fn_exec_local(dlg);
+    dbglog("apps: closed %s", display_name);
+}
+
+// Scan /mnt/onboard/.adds/apps/<name>/index.html, write a manifest
+// to apps/launcher/apps.json, then open the launcher web app. The
+// launcher renders an Android-style icon grid of the available apps.
+// All UI logic lives in HTML/CSS/JS; this C++ side just feeds it data.
+static void show_apps_launcher(void *parent) {
+    const char *appsDir = "/mnt/onboard/.adds/apps";
+    const char *launcherIdx = "/mnt/onboard/.adds/apps/launcher/index.html";
+
+    // Build apps.json next to the launcher so it can fetch it relative.
+    // Each entry: {"name": "...", "path": "file://...", "icon": "..."}
+    // The launcher links window.location to path on tap.
+    FILE *jf = fopen("/mnt/onboard/.adds/apps/launcher/apps.json", "w");
+    if (!jf) {
+        // Try to mkdir launcher first — if missing, we can't show anything
+        mkdir("/mnt/onboard/.adds/apps/launcher", 0755);
+        jf = fopen("/mnt/onboard/.adds/apps/launcher/apps.json", "w");
+        if (!jf) { dbglog("apps: cannot write apps.json"); return; }
+    }
+    fputs("[", jf);
+    int n = 0;
+    DIR *d = opendir(appsDir);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] == '.') continue;
+            if (strcmp(de->d_name, "launcher") == 0) continue;
+            char idx[320];
+            snprintf(idx, sizeof(idx), "%s/%s/index.html", appsDir, de->d_name);
+            struct stat st;
+            if (stat(idx, &st) != 0) continue;
+            // Optional icon at apps/<name>/icon.png or icon.svg
+            char iconRel[64] = "";
+            char iconPath[320];
+            snprintf(iconPath, sizeof(iconPath), "%s/%s/icon.svg", appsDir, de->d_name);
+            if (stat(iconPath, &st) == 0) {
+                snprintf(iconRel, sizeof(iconRel), "../%s/icon.svg", de->d_name);
+            } else {
+                snprintf(iconPath, sizeof(iconPath), "%s/%s/icon.png", appsDir, de->d_name);
+                if (stat(iconPath, &st) == 0)
+                    snprintf(iconRel, sizeof(iconRel), "../%s/icon.png", de->d_name);
+            }
+            if (n++) fputs(",", jf);
+            // Note: app names with quotes/backslashes will break JSON. We
+            // don't expect any in this controlled directory.
+            fprintf(jf, "{\"name\":\"%s\",\"path\":\"file://%s\",\"icon\":\"%s\"}",
+                    de->d_name, idx, iconRel);
+        }
+        closedir(d);
+    }
+    fputs("]", jf);
+    fclose(jf);
+
+    // If there's no launcher app, fall back to opening the first app
+    // directly so the user gets *something* useful.
+    struct stat lst;
+    if (stat(launcherIdx, &lst) != 0) {
+        dbglog("apps: launcher not installed, looking for any app");
+        DIR *d2 = opendir(appsDir);
+        if (!d2) return;
+        struct dirent *de;
+        while ((de = readdir(d2))) {
+            if (de->d_name[0] == '.') continue;
+            if (strcmp(de->d_name, "launcher") == 0) continue;
+            char idx[320];
+            snprintf(idx, sizeof(idx), "%s/%s/index.html", appsDir, de->d_name);
+            if (stat(idx, &lst) == 0) {
+                closedir(d2);
+                show_webapp(parent, idx, de->d_name);
+                return;
+            }
+        }
+        closedir(d2);
+        return;
+    }
+
+    show_webapp(parent, launcherIdx, "Apps");
+}
+
 static void show_panel(void *parent) {
     dbglog("show_panel");
     if (!fn_dlgCtor || !fn_new || !fn_setTitle) {
@@ -181,12 +419,15 @@ static void show_panel(void *parent) {
         // literal pattern string).
         bool ssh_on = (system(
             "pgrep -f '[d]ropbearmulti dropbear' >/dev/null 2>&1") == 0);
-        bool tunnel_on = (system(
-            "pgrep -f '[d]ropbearmulti dbclient' >/dev/null 2>&1") == 0);
 
         // Always read the IP so we can detect WiFi dropping mid-dialog.
         char ip[32] = {0};
         run_capture("ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2", ip, sizeof(ip));
+
+        // Tunnel requires both the dbclient process AND active WiFi — if WiFi
+        // is down the TCP connection is dead even if the process lingers.
+        bool tunnel_on = ip[0] && (system(
+            "pgrep -f '[d]ropbearmulti dbclient' >/dev/null 2>&1") == 0);
 
         // Snapshot for the poll thread auto-refresh watchdog
         strncpy(g_panelIp, ip, sizeof(g_panelIp) - 1);
@@ -329,6 +570,37 @@ static void show_panel(void *parent) {
         (void)tunnel_on; (void)tunInfoQS;
 #endif
 
+        // Pull Inbox — pulls files staged on chuzel.net over HTTPS (no tunnel
+        // needed). Label reflects the number of files waiting if we can see it.
+        // Files already present locally with matching md5 are skipped silently
+        // and don't contribute to the badge count.
+        int inbox_count = 0;
+        {
+            char buf[16] = {0};
+            // BusyBox wget can't SNI, so use python3 for the HTTPS query.
+            // Also filter out files already on-device with matching md5.
+            run_capture(
+                "/mnt/onboard/.adds/inbox-count.sh 2>/dev/null",
+                buf, sizeof(buf));
+            inbox_count = atoi(buf);
+        }
+
+        // Build the row label as char16_t directly — the glyph would be
+        // corrupted if we went through ascii_to_u16 (which treats each UTF-8
+        // byte as a separate codepoint). U+25BC is a basic triangle.
+        char16_t pullLabelU[64];
+        int pullLabelLen = 0;
+        const char16_t pullBase[] = u"\u25BC  Pull Inbox";
+        const int pullBaseLen = (int)(sizeof(pullBase)/sizeof(char16_t)) - 1;
+        for (int i = 0; i < pullBaseLen; i++) pullLabelU[pullLabelLen++] = pullBase[i];
+        if (inbox_count > 0) {
+            char countStr[16];
+            snprintf(countStr, sizeof(countStr), " (%d)", inbox_count);
+            for (int i = 0; countStr[i] && pullLabelLen < 63; i++)
+                pullLabelU[pullLabelLen++] = (char16_t)countStr[i];
+        }
+        void *pullTouch = makeMenuRow(pullLabelU, pullLabelLen, false, false);
+
         void *refreshTouch = makeMenuRow(
             u"\u21BB  Refresh Library", 18, false, false);
 
@@ -336,13 +608,15 @@ static void show_panel(void *parent) {
         void *wifiTouch = makeMenuRow(
             u"\u21BB  Reconnect WiFi", 17, false, false);
 
+        // (Apps row was removed — Apps is now its own Mehr-menu entry)
+
         // Hidden trackers — tap toggles tracker AND closes dialog.
-        // Slots for ssh / tunnel / refresh / wifi; the tunnel slot is nullptr
-        // in public builds and is simply skipped.
+        // Slots for ssh / tunnel / pull / refresh / wifi; the tunnel slot is
+        // nullptr in public builds and is simply skipped.
         STACK_QS(emptyStr, u"", 0);
-        void *trackers[4] = {nullptr, nullptr, nullptr, nullptr};
-        void *touches[4]  = {sshTouch, tunTouch, refreshTouch, wifiTouch};
-        for (int i = 0; i < 4; i++) {
+        void *trackers[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+        void *touches[5]  = {sshTouch, tunTouch, pullTouch, refreshTouch, wifiTouch};
+        for (int i = 0; i < 5; i++) {
             if (!touches[i]) continue;
             trackers[i] = fn_new(32768);
             fn_btnCtor(trackers[i], &emptyStr, nullptr);
@@ -386,13 +660,70 @@ static void show_panel(void *parent) {
             }
         }
         if (trackers[2] && fn_isChecked(trackers[2])) {
+            dbglog("panel: pulling inbox");
+            system("/mnt/onboard/.adds/pull-inbox.sh >/tmp/tolinom-pull-out 2>&1");
+            do_library_sync();
+            // If anything was pulled, ask whether to keep it on the server.
+            if (access("/tmp/tolinom-inbox-pulled", F_OK) == 0) {
+                // Build body listing the pulled filenames
+                char body[512] = "Pulled:\n";
+                FILE *lf = fopen("/tmp/tolinom-inbox-pulled", "r");
+                if (lf) {
+                    char line[128];
+                    int used = strlen(body);
+                    while (fgets(line, sizeof(line), lf) && used < (int)sizeof(body) - 2) {
+                        int n = strlen(line);
+                        if (n > 0 && line[n-1] == '\n') line[--n] = 0;
+                        int w = snprintf(body + used, sizeof(body) - used, "  %s\n", line);
+                        if (w < 0 || used + w >= (int)sizeof(body)) break;
+                        used += w;
+                    }
+                    fclose(lf);
+                }
+                char16_t bodyU[512];
+                int bodyLen = ascii_to_u16(body, bodyU, 512);
+
+                void *cd = fn_new(32768);
+                if (cd) {
+                    fn_dlgCtor(cd, parent);
+                    STACK_QS(ctitle, u"Downloaded from inbox", 21);
+                    fn_setTitle(cd, &ctitle);
+                    FakeQString bodyQS = {nullptr, bodyU, bodyLen};
+                    fn_setText(cd, &bodyQS);
+                    if (fn_showClose) fn_showClose(cd, true);
+                    if (fn_setRejVis) fn_setRejVis(cd, true);
+                    if (fn_setAccVis) fn_setAccVis(cd, true);
+                    STACK_QS(keepTxt, u"Keep on server", 14);
+                    fn_setAccBtn(cd, &keepTxt);
+                    // Reject button label via reflection: same setter pattern
+                    typedef void (*setRejText_t)(void*, const void*);
+                    static setRejText_t fn_setRejBtn = nullptr;
+                    if (!fn_setRejBtn) fn_setRejBtn = (setRejText_t)dlsym(RTLD_DEFAULT,
+                        "_ZN18ConfirmationDialog19setRejectButtonTextERK7QString");
+                    STACK_QS(delTxt, u"Delete from server", 18);
+                    if (fn_setRejBtn) fn_setRejBtn(cd, &delTxt);
+
+                    int cr = fn_exec(cd);
+                    dbglog("inbox-confirm: result=%d", cr);
+                    if (cr == 0) {
+                        // Rejected — user chose to delete from server
+                        system("/mnt/onboard/.adds/clear-inbox.sh /tmp/tolinom-inbox-pulled");
+                    } else {
+                        // Accepted or dismissed — keep files, drop the list
+                        unlink("/tmp/tolinom-inbox-pulled");
+                    }
+                }
+            }
+        }
+        if (trackers[3] && fn_isChecked(trackers[3])) {
             dbglog("panel: refreshing library");
             do_library_sync();
         }
-        if (trackers[3] && fn_isChecked(trackers[3])) {
+        if (trackers[4] && fn_isChecked(trackers[4])) {
             dbglog("panel: reconnecting wifi");
             system("/mnt/onboard/.adds/wifi-reconnect.sh &");
         }
+        // (Apps row removed — Apps lives as its own Mehr-menu entry now)
 
         // Loop back to show updated status
     }
@@ -497,33 +828,89 @@ void nm_hook_setupUi(void *_this, QWidget *widget) {
     dbglog("MenuTextItem=%p shim=%p betaFeatures on %p", btn, shim, widget);
 
     g_scriptsBtn = shim;  // track the shim, not the MenuTextItem
+
+    // Second Mehr-menu entry: "Apps" — bypasses the Tolino Hacks panel
+    // and opens the HTML app launcher directly.
+    void *apbtn = fn_new(32768);
+    if (apbtn) {
+        fn_miCtor(apbtn, (void*)ui[1], false, false);
+        STACK_QS(aplabel, u"Apps", 4);
+        fn_miSetText(apbtn, &aplabel);
+        if (fn_miRegGest) fn_miRegGest(apbtn);
+        if (fn_setSS) {
+            STACK_QS(apcss, u"*{font-style:normal;font-weight:normal;}", 41);
+            fn_setSS(apbtn, &apcss);
+        }
+        // Match Tolino Hacks: vertical breathing room above and below
+        if (fn_addSpacing) fn_addSpacing(targetLayout, 18);
+        fn_addWidget(targetLayout, apbtn, 0, 0);
+        if (fn_addSpacing) fn_addSpacing(targetLayout, 18);
+
+        if (fn_frameCtor && fn_setShape) {
+            typedef void (*setFrameShadow_t3)(void*, int);
+            typedef void (*setLineWidth_t2)(void*, int);
+            setFrameShadow_t3 fn_setShadow2 = (setFrameShadow_t3)dlsym(RTLD_DEFAULT, "_ZN6QFrame14setFrameShadowENS_6ShadowE");
+            setLineWidth_t2   fn_setLW2     = (setLineWidth_t2)   dlsym(RTLD_DEFAULT, "_ZN6QFrame12setLineWidthEi");
+            void *sep2 = fn_new(2048);
+            if (sep2) {
+                fn_frameCtor(sep2, (void*)ui[1], 0);
+                fn_setShape(sep2, 4);
+                if (fn_setShadow2) fn_setShadow2(sep2, 16);
+                if (fn_setLW2)     fn_setLW2(sep2, 2);
+                if (fn_setSS) {
+                    STACK_QS(sep2Css, u"QFrame{color:#888;margin:0 24px;}", 33);
+                    fn_setSS(sep2, &sep2Css);
+                }
+                fn_addWidget(targetLayout, sep2, 0, 0);
+            }
+        }
+
+        void *apshim = fn_new(32768);
+        fn_btnCtor(apshim, &emptyStr, widget);
+        fn_setCheckable(apshim, true);
+        FakeConnection apc1 = {nullptr};
+        fn_connect(&apc1, apbtn, "2tapped(bool)", apshim, "1toggle()", 0);
+        FakeConnection apc2 = {nullptr};
+        fn_connect(&apc2, apshim, "2toggled(bool)", widget, "2betaFeatures()", 0);
+        g_appsBtn = apshim;
+    }
 }
 
 // Hook: MoreView::betaFeatures - intercept when Scripts button triggers it
 __attribute__((visibility("default")))
 void nm_hook_betaFeatures(void *_this) {
-    dbglog("betaFeatures called, this=%p scriptsBtn=%p", _this, g_scriptsBtn);
+    dbglog("betaFeatures called, this=%p scripts=%p apps=%p",
+        _this, g_scriptsBtn, g_appsBtn);
 
-    // Check if triggered by our Scripts button
-    if (g_scriptsBtn && fn_isChecked && fn_isChecked(g_scriptsBtn)) {
-        dbglog("triggered by Scripts button!");
-        // Uncheck the shim — but block signals first so resetting
-        // doesn't fire toggled(false) → betaFeatures() → real Beta dialog
-        typedef bool (*blockSig_t)(void*, bool);
-        typedef void (*setChecked_t)(void*, bool);
-        blockSig_t fn_block = (blockSig_t)dlsym(RTLD_DEFAULT, "_ZN7QObject12blockSignalsEb");
-        setChecked_t fn_sc = (setChecked_t)dlsym(RTLD_DEFAULT, "_ZN15QAbstractButton10setCheckedEb");
+    typedef bool (*blockSig_t)(void*, bool);
+    typedef void (*setChecked_t)(void*, bool);
+    static blockSig_t fn_block = nullptr;
+    static setChecked_t fn_sc = nullptr;
+    if (!fn_block) fn_block = (blockSig_t)dlsym(RTLD_DEFAULT, "_ZN7QObject12blockSignalsEb");
+    if (!fn_sc)    fn_sc    = (setChecked_t)dlsym(RTLD_DEFAULT, "_ZN15QAbstractButton10setCheckedEb");
+
+    auto reset_shim = [&](void *shim) {
+        // Uncheck without firing toggled(false) → betaFeatures recursion
         bool prev = false;
-        if (fn_block) prev = fn_block(g_scriptsBtn, true);
-        if (fn_sc) fn_sc(g_scriptsBtn, false);
-        if (fn_block) fn_block(g_scriptsBtn, prev);
+        if (fn_block) prev = fn_block(shim, true);
+        if (fn_sc) fn_sc(shim, false);
+        if (fn_block) fn_block(shim, prev);
+    };
 
-        // Show our custom dialog
+    if (g_scriptsBtn && fn_isChecked && fn_isChecked(g_scriptsBtn)) {
+        dbglog("triggered by Tolino Hacks button");
+        reset_shim(g_scriptsBtn);
         show_panel(_this);
         return;
     }
+    if (g_appsBtn && fn_isChecked && fn_isChecked(g_appsBtn)) {
+        dbglog("triggered by Apps button");
+        reset_shim(g_appsBtn);
+        show_apps_launcher(_this);
+        return;
+    }
 
-    // Not our button - call original betaFeatures
+    // Not our button — call original betaFeatures
     dbglog("calling original betaFeatures");
     orig_betaFeatures(_this);
 }
@@ -664,7 +1051,7 @@ static void *poll_thread(void *) {
                 "ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2",
                 ip_now, sizeof(ip_now));
             int ssh_now = (system("pgrep -f '[d]ropbearmulti dropbear' >/dev/null 2>&1") == 0) ? 1 : 0;
-            int tun_now = (system("pgrep -f '[d]ropbearmulti dbclient' >/dev/null 2>&1") == 0) ? 1 : 0;
+            int tun_now = (ip_now[0] && system("pgrep -f '[d]ropbearmulti dbclient' >/dev/null 2>&1") == 0) ? 1 : 0;
             if (ssh_now != g_panelSsh || tun_now != g_panelTun
                 || strncmp(ip_now, g_panelIp, sizeof(g_panelIp)) != 0) {
                 void *dlg = g_panelDlg;

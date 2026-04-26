@@ -32,15 +32,20 @@ case $STAGE in
     # Try to extract from archive
     if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
         tar xf "$ARCHIVE" -C /etc/tolino-hacks/ .adds/ 2>/dev/null
-        # If .adds/ was extracted inside tolino-hacks, flatten it
+        # If .adds/ was extracted inside tolino-hacks, flatten the top
+        # level (libs and scripts) but preserve the apps/ subtree intact.
         if [ -d /etc/tolino-hacks/.adds ]; then
             cp /etc/tolino-hacks/.adds/* /etc/tolino-hacks/ 2>/dev/null
+            if [ -d /etc/tolino-hacks/.adds/apps ]; then
+                cp -r /etc/tolino-hacks/.adds/apps /etc/tolino-hacks/
+            fi
             rm -rf /etc/tolino-hacks/.adds
         fi
     fi
     # Copy from staging directory (if updater pre-extracted)
     if [ -d "$SCRIPT_DIR/.adds" ]; then
         cp "$SCRIPT_DIR/.adds/"* /etc/tolino-hacks/ 2>/dev/null
+        [ -d "$SCRIPT_DIR/.adds/apps" ] && cp -r "$SCRIPT_DIR/.adds/apps" /etc/tolino-hacks/
     fi
     chmod +x /etc/tolino-hacks/dropbearmulti 2>/dev/null
     chmod +x /etc/tolino-hacks/*.sh 2>/dev/null
@@ -49,6 +54,7 @@ case $STAGE in
     if [ -w /mnt/onboard/ ]; then
         mkdir -p /mnt/onboard/.adds
         cp /etc/tolino-hacks/* /mnt/onboard/.adds/ 2>/dev/null
+        [ -d /etc/tolino-hacks/apps ] && cp -r /etc/tolino-hacks/apps /mnt/onboard/.adds/
         chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
         chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
     fi
@@ -82,6 +88,11 @@ case "$1" in
         if [ -d /etc/tolino-hacks ] && [ -f /etc/tolino-hacks/dropbearmulti ]; then
             mkdir -p /mnt/onboard/.adds
             cp -n /etc/tolino-hacks/* /mnt/onboard/.adds/ 2>/dev/null
+            # Apps directory: copy the bundled launcher and any sample apps
+            # only if the user hasn't already created their own apps tree.
+            if [ -d /etc/tolino-hacks/apps ] && [ ! -d /mnt/onboard/.adds/apps ]; then
+                cp -r /etc/tolino-hacks/apps /mnt/onboard/.adds/
+            fi
             chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
             chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
         fi

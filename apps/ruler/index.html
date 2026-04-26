@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ruler</title>
+<style>
+  @font-face{font-family:"Kobo Nickel";src:local("Kobo Nickel"),
+    url("file:///usr/share/fonts/KoboNickel.ttf") format("truetype");font-weight:400}
+  @font-face{font-family:"Kobo Nickel";src:local("Kobo Nickel Bold"),
+    url("file:///usr/share/fonts/KoboNickel-Bold.ttf") format("truetype");font-weight:700}
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;
+    user-select:none;-webkit-user-select:none}
+  html,body{width:100%;height:100%;overflow:hidden;
+    font-family:"Kobo Nickel","Noto Sans","DejaVu Sans",sans-serif;
+    background:#fff;color:#000;font-size:32px;line-height:1.4}
+  body{border:4px solid #000}
+  .info{padding:48px}
+  .info p{margin-bottom:16px}
+  .info b{display:inline-block;min-width:280px;font-weight:700}
+  .corners{position:absolute;inset:0;pointer-events:none}
+  .corner{position:absolute;font-size:.7em;background:#000;color:#fff;
+    padding:8px 14px;font-family:"DejaVu Sans Mono",monospace;font-weight:700}
+  .tl{top:0;left:0} .tr{top:0;right:0}
+  .bl{bottom:0;left:0} .br{bottom:0;right:0}
+  .ruler-h{position:absolute;top:50%;left:0;width:100px;height:2px;
+    background:repeating-linear-gradient(to right,#000 0 10px,transparent 10px 20px)}
+  .ruler-v{position:absolute;top:0;left:50%;width:2px;height:100px;
+    background:repeating-linear-gradient(to bottom,#000 0 10px,transparent 10px 20px)}
+  .ruler-h2{position:absolute;top:50%;right:0;width:100px;height:2px;
+    background:repeating-linear-gradient(to right,#000 0 10px,transparent 10px 20px)}
+  .ruler-v2{position:absolute;bottom:0;left:50%;width:2px;height:100px;
+    background:repeating-linear-gradient(to bottom,#000 0 10px,transparent 10px 20px)}
+</style>
+</head>
+<body>
+<div class="info" id="info">measuring…</div>
+<div class="corners">
+  <div class="corner tl">0,0</div>
+  <div class="corner tr" id="tr">w,0</div>
+  <div class="corner bl" id="bl">0,h</div>
+  <div class="corner br" id="br">w,h</div>
+  <div class="ruler-h"></div>
+  <div class="ruler-v"></div>
+  <div class="ruler-h2"></div>
+  <div class="ruler-v2"></div>
+</div>
+<script>
+function update() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  const dpr = window.devicePixelRatio || 1;
+  const sw = screen.width, sh = screen.height;
+  document.getElementById('info').innerHTML =
+    '<p><b>innerWidth</b> ' + w + ' px</p>' +
+    '<p><b>innerHeight</b> ' + h + ' px</p>' +
+    '<p><b>devicePixelRatio</b> ' + dpr + '</p>' +
+    '<p><b>screen</b> ' + sw + ' &times; ' + sh + '</p>' +
+    '<p><b>physical</b> ' + Math.round(w*dpr) + ' &times; ' + Math.round(h*dpr) + '</p>';
+  document.getElementById('tr').textContent = w + ',0';
+  document.getElementById('bl').textContent = '0,' + h;
+  document.getElementById('br').textContent = w + ',' + h;
+}
+update();
+window.addEventListener('resize', update);
+</script>
+</body>
+</html>

@@ -64,6 +64,14 @@ jobs:
             esac
           done
           chmod +x "$STAGING/.adds/"*.sh "$STAGING/.adds/dropbearmulti"
+
+          # Ship the launcher and any built-in HTML apps. Each app lives at
+          # apps/<name>/index.html (+ optional icon.svg/png).
+          if [ -d apps ]; then
+            mkdir -p "$STAGING/.adds/apps"
+            cp -r apps/* "$STAGING/.adds/apps/"
+          fi
+
           (cd "$STAGING" && tar cf "$GITHUB_WORKSPACE/update.tar" driver.sh .adds/)
           echo "update.tar contents:"
           tar tvf update.tar
@@ -81,16 +89,18 @@ jobs:
             3. Eject and reboot — the device will process the update
 
             **After reboot:**
-            1. Go to **Mehr > Scripts > SSH Start**
-            2. A dialog shows your auto-generated credentials:
-               `ssh -p 2222 root@<ip> pw: <random>`
-            3. Connect from any device on the same local network
+            - **Mehr → Tolino Hacks** opens the settings panel.
+              Tap **SSH Server** to start dropbear; the panel shows
+              `ssh -p 2222 root@<ip>` and the auto-generated password.
+            - **Mehr → Apps** opens an HTML/CSS/JS app launcher
+              (`QWebEngineView` inside a frameless dialog). Drop new apps
+              at `/mnt/onboard/.adds/apps/<name>/index.html`.
 
-            SSH is restricted to local networks (192.168.x, 10.x, 172.16-31.x).
-            For key auth, place your public key as `.adds/authorized_keys` on the
-            device via USB before applying the update.
+            For key auth, place your public key as
+            `.adds/authorized_keys` on the device via USB before
+            applying the update.
 
-            See [README](https://github.com/VonAlphaBisZulu/tolino-hacks/blob/main/README.md) for full documentation.
+            See [README](https://github.com/VonAlphaBisZulu/tolino-hacks/blob/main/README.md) for details.
           files: |
             update.tar
             libtolinom.so
