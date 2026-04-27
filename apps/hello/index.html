@@ -5,13 +5,15 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Hello Tolino</title>
 <style>
-  @font-face{font-family:"Kobo Nickel";src:local("Kobo Nickel"),
-    url("file:///usr/share/fonts/KoboNickel.ttf") format("truetype");font-weight:400}
-  @font-face{font-family:"Kobo Nickel";src:local("Kobo Nickel Bold"),
-    url("file:///usr/share/fonts/KoboNickel-Bold.ttf") format("truetype");font-weight:700}
+  @font-face{font-family:"Tolino UI";font-weight:400;
+    src:local("RakutenSansUIApp"),
+        url("file:///usr/share/fonts/RakutenSansUIApp-Regular.ttf") format("truetype")}
+  @font-face{font-family:"Tolino UI";font-weight:700;
+    src:local("RakutenSansUIApp Bold"),
+        url("file:///usr/share/fonts/RakutenSansUIApp-Bold.ttf") format("truetype")}
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;
     user-select:none;-webkit-user-select:none}
-  body{font-family:"Kobo Nickel","Noto Sans","DejaVu Sans",sans-serif;
+  body{font-family:"Tolino UI","Noto Sans","DejaVu Sans",sans-serif;
        background:#fff;color:#000;margin:0;padding:48px;
        font-size:32px;line-height:1.5}
   h1{font-size:1.6em;border-bottom:3px solid #000;padding-bottom:16px;

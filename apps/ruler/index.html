@@ -5,14 +5,16 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ruler</title>
 <style>
-  @font-face{font-family:"Kobo Nickel";src:local("Kobo Nickel"),
-    url("file:///usr/share/fonts/KoboNickel.ttf") format("truetype");font-weight:400}
-  @font-face{font-family:"Kobo Nickel";src:local("Kobo Nickel Bold"),
-    url("file:///usr/share/fonts/KoboNickel-Bold.ttf") format("truetype");font-weight:700}
+  @font-face{font-family:"Tolino UI";font-weight:400;
+    src:local("RakutenSansUIApp"),
+        url("file:///usr/share/fonts/RakutenSansUIApp-Regular.ttf") format("truetype")}
+  @font-face{font-family:"Tolino UI";font-weight:700;
+    src:local("RakutenSansUIApp Bold"),
+        url("file:///usr/share/fonts/RakutenSansUIApp-Bold.ttf") format("truetype")}
   *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;
     user-select:none;-webkit-user-select:none}
   html,body{width:100%;height:100%;overflow:hidden;
-    font-family:"Kobo Nickel","Noto Sans","DejaVu Sans",sans-serif;
+    font-family:"Tolino UI","Noto Sans","DejaVu Sans",sans-serif;
     background:#fff;color:#000;font-size:32px;line-height:1.4}
   body{border:4px solid #000}
   .info{padding:48px}

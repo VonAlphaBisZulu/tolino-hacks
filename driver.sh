@@ -33,19 +33,22 @@ case $STAGE in
     if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
         tar xf "$ARCHIVE" -C /etc/tolino-hacks/ .adds/ 2>/dev/null
         # If .adds/ was extracted inside tolino-hacks, flatten the top
-        # level (libs and scripts) but preserve the apps/ subtree intact.
+        # level (libs and scripts) but preserve subtrees (apps, icons).
         if [ -d /etc/tolino-hacks/.adds ]; then
             cp /etc/tolino-hacks/.adds/* /etc/tolino-hacks/ 2>/dev/null
-            if [ -d /etc/tolino-hacks/.adds/apps ]; then
-                cp -r /etc/tolino-hacks/.adds/apps /etc/tolino-hacks/
-            fi
+            for sub in apps icons; do
+                if [ -d "/etc/tolino-hacks/.adds/$sub" ]; then
+                    cp -r "/etc/tolino-hacks/.adds/$sub" /etc/tolino-hacks/
+                fi
+            done
             rm -rf /etc/tolino-hacks/.adds
         fi
     fi
     # Copy from staging directory (if updater pre-extracted)
     if [ -d "$SCRIPT_DIR/.adds" ]; then
         cp "$SCRIPT_DIR/.adds/"* /etc/tolino-hacks/ 2>/dev/null
-        [ -d "$SCRIPT_DIR/.adds/apps" ] && cp -r "$SCRIPT_DIR/.adds/apps" /etc/tolino-hacks/
+        [ -d "$SCRIPT_DIR/.adds/apps"  ] && cp -r "$SCRIPT_DIR/.adds/apps"  /etc/tolino-hacks/
+        [ -d "$SCRIPT_DIR/.adds/icons" ] && cp -r "$SCRIPT_DIR/.adds/icons" /etc/tolino-hacks/
     fi
     chmod +x /etc/tolino-hacks/dropbearmulti 2>/dev/null
     chmod +x /etc/tolino-hacks/*.sh 2>/dev/null
@@ -54,7 +57,8 @@ case $STAGE in
     if [ -w /mnt/onboard/ ]; then
         mkdir -p /mnt/onboard/.adds
         cp /etc/tolino-hacks/* /mnt/onboard/.adds/ 2>/dev/null
-        [ -d /etc/tolino-hacks/apps ] && cp -r /etc/tolino-hacks/apps /mnt/onboard/.adds/
+        [ -d /etc/tolino-hacks/apps  ] && cp -r /etc/tolino-hacks/apps  /mnt/onboard/.adds/
+        [ -d /etc/tolino-hacks/icons ] && cp -r /etc/tolino-hacks/icons /mnt/onboard/.adds/
         chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
         chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
     fi
@@ -93,6 +97,10 @@ case "$1" in
             if [ -d /etc/tolino-hacks/apps ] && [ ! -d /mnt/onboard/.adds/apps ]; then
                 cp -r /etc/tolino-hacks/apps /mnt/onboard/.adds/
             fi
+            # Icons used by the Mehr menu MenuTextItems (gear, app grid).
+            if [ -d /etc/tolino-hacks/icons ] && [ ! -d /mnt/onboard/.adds/icons ]; then
+                cp -r /etc/tolino-hacks/icons /mnt/onboard/.adds/
+            fi
             chmod +x /mnt/onboard/.adds/dropbearmulti 2>/dev/null
             chmod +x /mnt/onboard/.adds/*.sh 2>/dev/null
         fi
@@ -104,6 +112,13 @@ case "$1" in
         if [ ! -f /mnt/onboard/.adds/epdc-fast-default-set ]; then
             touch /mnt/onboard/.adds/tolinom-epdc-fast
             touch /mnt/onboard/.adds/epdc-fast-default-set
+        fi
+        # Default-enable the embed launch mode (Apps view slots into
+        # nickel's nav stack like Library/Home) — much more natural than
+        # the floating dialog. Users can rm it to fall back.
+        if [ ! -f /mnt/onboard/.adds/embed-default-set ]; then
+            touch /mnt/onboard/.adds/tolinom-embed
+            touch /mnt/onboard/.adds/embed-default-set
         fi
         # SSH does NOT auto-start on boot — users would wonder why the
         # device never sleeps. Create /mnt/onboard/.adds/ssh-autostart as

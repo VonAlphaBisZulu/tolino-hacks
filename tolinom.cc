@@ -149,6 +149,10 @@ extern "C" int close(int fd) {
 // Set when our QDialog (Apps) is visible, so we only rewrite waveforms
 // during app interaction — not during normal Tolino UI use.
 static volatile int g_app_active = 0;
+// Per-app refresh policy: 0 = fast (force PARTIAL, monochrome, no flash),
+// 1 = color (leave PARTIAL/FULL alone — keeps color but flashes). Apps opt
+// into color via manifest.json: {"refresh":"color"}.
+static volatile int g_app_color_mode = 0;
 static bool epdc_fast_mode() {
     return access("/mnt/onboard/.adds/tolinom-epdc-fast", F_OK) == 0;
 }
@@ -156,6 +160,30 @@ static bool epdc_fast_mode() {
 // 0x4024462e = MXCFB_SEND_UPDATE on this driver (verified via trace).
 // Type='F' (0x46), nr=0x2e, write, size=36 bytes (matches our struct).
 #define KOBO_MXCFB_SEND_UPDATE 0x4024462eUL
+
+// Send a full-screen GC16 FULL update bypassing our own override. Used to
+// scrub residual ghost from DU partial paints when our app dialog closes,
+// otherwise nickel's incremental Mehr-menu repaints don't fully redraw
+// thin lines like the separators around our buttons.
+static void epdc_full_refresh() {
+    static int (*real_ioctl)(int, unsigned long, ...) = nullptr;
+    if (!real_ioctl) real_ioctl = (int(*)(int, unsigned long, ...))dlsym(RTLD_NEXT, "ioctl");
+    int fd = -1;
+    for (int i = 0; i < 1024; i++) if (fdkind[i] == 1) { fd = i; break; }
+    if (fd < 0 || !real_ioctl) return;
+    EpdcUpdateData u;
+    memset(&u, 0, sizeof(u));
+    u.update_region.x = 0;
+    u.update_region.y = 0;
+    u.update_region.w = 1072;
+    u.update_region.h = 1448;
+    u.waveform_mode = 2;     // GC16
+    u.update_mode   = 1;     // FULL — drives the cleanup waveform cycle
+    u.update_marker = 0;
+    u.temp = -1;             // TEMP_USE_AMBIENT
+    u.flags = 0;
+    real_ioctl(fd, KOBO_MXCFB_SEND_UPDATE, &u);
+}
 
 extern "C" int ioctl(int fd, unsigned long request, ...) {
     static int (*real_ioctl)(int, unsigned long, ...) = nullptr;
@@ -171,18 +199,17 @@ extern "C" int ioctl(int fd, unsigned long request, ...) {
         // (GC16, REAGL) to DU so partial paints don't trigger the
         // multi-flash full refresh. INIT and AUTO are left alone — INIT
         // is only sent rarely (first paint) and AUTO is already adaptive.
-        if (g_app_active && epdc_fast_mode()) {
+        if (g_app_active && !g_app_color_mode && epdc_fast_mode()) {
             unsigned int orig_wf   = u->waveform_mode;
             unsigned int orig_mode = u->update_mode;
-            // DU (1) is 2-bit fast partial; switch heavy waveforms to it.
-            if (orig_wf == 2 /*GC16*/ || orig_wf == 6 /*REAGL*/) {
-                u->waveform_mode = 1; // DU
-            }
-            // The flash comes from update_mode=1 (UPDATE_MODE_FULL) which
-            // drives the EPDC through a complete waveform cycle (clear +
-            // redraw). Force PARTIAL so the controller skips the cleanup
-            // pass — that's what kills the visible flicker.
+            // Fast/monochrome path: forcing PARTIAL kills the flash but
+            // also kills color rendering on Kaleido 3 (the FULL waveform
+            // cycle is what drives subpixel grey levels precisely enough
+            // to show color through the RGB filter). Apps that need color
+            // set "refresh":"color" in manifest.json and skip this whole
+            // block.
             if (u->update_mode == 1) u->update_mode = 0;
+            (void)orig_wf;
             if (epdc_tracing() && (orig_wf != u->waveform_mode || orig_mode != u->update_mode))
                 epdc_logf("REWRITE wf %u(%s)->%u(%s) mode %u->%u region=(%u,%u %ux%u)",
                     orig_wf, waveform_name(orig_wf),
@@ -388,15 +415,75 @@ static void show_webapp(void *parent, const char *index_path,
     if (!dlg) return;
     fn_qDlgCtor(dlg, parent, 0x00000800);
 
-    // QVBoxLayout that owns the dialog's layout slot.
-    void *layout = fn_new(2048);
-    if (layout) fn_vboxCtor(layout, dlg);
-    if (layout && fn_layMargins) fn_layMargins(layout, 0, 0, 0, 0);
+    // Force application-level modality so input is fully captured and the
+    // very first tap inside the dialog reaches the WebView (without it,
+    // the first event sometimes only activates the window).
+    typedef void (*setMod_t)(void*, int);
+    static setMod_t fn_setMod = nullptr;
+    if (!fn_setMod) fn_setMod = (setMod_t)dlsym(RTLD_DEFAULT,
+        "_ZN7QWidget17setWindowModalityEN2Qt15WindowModalityE");
+    // NonModal (0): the dialog stays open via exec()'s event loop but
+    // does NOT grab input, so taps in the status-bar gutter actually
+    // reach nickel's status bar widgets (WiFi icon, etc.) instead of
+    // being absorbed by our modal.
+    if (fn_setMod) fn_setMod(dlg, 0); // Qt::NonModal
 
-    // QWebEngineView fills the layout.
-    void *view = fn_new(131072);
-    if (!view) return;
-    fn_viewCtor(view, nullptr);
+    // Make sure the view accepts touch events directly, not just synthetic
+    // mouse events converted from touches (the conversion adds a focus-grab
+    // hop). WidgetAttribute::WA_AcceptTouchEvents = 64 in Qt 6.
+    typedef void (*setAttr_t)(void*, int, bool);
+    static setAttr_t fn_setAttr = nullptr;
+    if (!fn_setAttr) fn_setAttr = (setAttr_t)dlsym(RTLD_DEFAULT,
+        "_ZN7QWidget12setAttributeEN2Qt15WidgetAttributeEb");
+
+    // Try nickel's BaseDialogWebView for HTTPS-capable WebView. Skip the
+    // QVBoxLayout entirely on this path — wrapper sets its own geometry
+    // as a child of dlg. Survival logging at each step so we can see which
+    // call crashes if this attempt also fails.
+    typedef void  (*basedlgwv_ctor_t)(void*, void*);
+    typedef void* (*getwv_t)(void*);
+    static basedlgwv_ctor_t fn_bdwvCtor = nullptr;
+    static getwv_t          fn_getwv    = nullptr;
+    if (!fn_bdwvCtor) fn_bdwvCtor = (basedlgwv_ctor_t)dlsym(RTLD_DEFAULT, "_ZN17BaseDialogWebViewC1EP7QWidget");
+    if (!fn_getwv)    fn_getwv    = (getwv_t)dlsym(RTLD_DEFAULT, "_ZN17BaseDialogWebView10getWebViewEv");
+
+    void *layout  = nullptr;
+    void *wrapper = nullptr;
+    void *view    = nullptr;
+    bool tryBdwv  = (fn_bdwvCtor && fn_getwv);
+    // Opt-out file: if /mnt/onboard/.adds/tolinom-no-bdwv exists, skip and
+    // use raw QWebEngineView. Lets you recover without re-flashing if a
+    // nickel update breaks the BaseDialogWebView path.
+    if (access("/mnt/onboard/.adds/tolinom-no-bdwv", F_OK) == 0) tryBdwv = false;
+
+    if (tryBdwv) {
+        dbglog("apps: about to fn_new(262144) for BaseDialogWebView");
+        wrapper = fn_new(262144);
+        dbglog("apps: wrapper allocated at %p; calling ctor with dlg=%p", wrapper, dlg);
+        if (wrapper) {
+            fn_bdwvCtor(wrapper, (QWidget*)dlg);
+            dbglog("apps: BaseDialogWebView ctor returned");
+            // Inner view may be lazy-created on first show(). Show wrapper
+            // first, then probe.
+            typedef void (*show_t)(void*);
+            static show_t fn_show2 = nullptr;
+            if (!fn_show2) fn_show2 = (show_t)dlsym(RTLD_DEFAULT, "_ZN7QWidget4showEv");
+            if (fn_show2) { fn_show2(wrapper); dbglog("apps: wrapper shown"); }
+            view = fn_getwv(wrapper);
+            dbglog("apps: getWebView returned %p", view);
+        }
+    }
+    if (!view) {
+        // Fallback: raw QWebEngineView with our own QVBoxLayout
+        layout = fn_new(2048);
+        if (layout) fn_vboxCtor(layout, dlg);
+        if (layout && fn_layMargins) fn_layMargins(layout, 0, 0, 0, 0);
+        view = fn_new(131072);
+        if (!view) return;
+        fn_viewCtor(view, nullptr);
+        wrapper = view;
+        dbglog("apps: fallback raw QWebEngineView=%p", view);
+    }
 
     // Disable Chromium context menu — long-press on touch fires it,
     // and "Open in new window" creates orphan top-level windows.
@@ -406,9 +493,59 @@ static void show_webapp(void *parent, const char *index_path,
         "_ZN7QWidget20setContextMenuPolicyEN2Qt17ContextMenuPolicyE");
     if (fn_setCtxPolicy) fn_setCtxPolicy(view, 0); // Qt::NoContextMenu
 
+    // Accept touches directly (avoids the touch->mouse synthetic conversion
+    // that costs us the first tap). 64 = Qt::WA_AcceptTouchEvents in Qt 6.
+    if (fn_setAttr) {
+        fn_setAttr(view, 64, true);
+        fn_setAttr(dlg,  64, true);
+    }
+
+    // Allow our file:// launcher (and apps) to load https:// content.
+    // Chromium blocks this by default — file:// is treated as a unique
+    // origin and remote URLs need an opt-in attribute on the page's
+    // settings. The same attribute is set by nickel's beta browser.
+    typedef void* (*pageSettings_t)(const void*);
+    typedef void  (*setSettingsAttr_t)(void*, int, bool);
+    static pageSettings_t    fn_pageSettings = nullptr;
+    static setSettingsAttr_t fn_settingsAttr = nullptr;
+    if (!fn_pageSettings) fn_pageSettings = (pageSettings_t)dlsym(RTLD_DEFAULT,
+        "_ZNK14QWebEnginePage8settingsEv");
+    if (!fn_settingsAttr) fn_settingsAttr = (setSettingsAttr_t)dlsym(RTLD_DEFAULT,
+        "_ZN18QWebEngineSettings12setAttributeENS_12WebAttributeEb");
+    typedef void* (*pageGetter2_t)(const void*);
+    static pageGetter2_t fn_pageOf = nullptr;
+    if (!fn_pageOf) fn_pageOf = (pageGetter2_t)dlsym(RTLD_DEFAULT,
+        "_ZNK14QWebEngineView4pageEv");
+    if (fn_pageOf && fn_pageSettings && fn_settingsAttr) {
+        void *page = fn_pageOf(view);
+        if (page) {
+            void *settings = fn_pageSettings(page);
+            if (settings) {
+                // QWebEngineSettings::WebAttribute enum values (Qt 6.5):
+                //   6 = LocalContentCanAccessRemoteUrls
+                //   9 = LocalContentCanAccessFileUrls
+                //  22 = AllowRunningInsecureContent
+                fn_settingsAttr(settings, 6,  true);
+                fn_settingsAttr(settings, 9,  true);
+                fn_settingsAttr(settings, 22, true);
+                dbglog("apps: enabled remote/file/insecure access on page");
+            }
+        }
+    }
+
     fn_viewSetUrl(view, &url);
 
-    if (layout && fn_addWidget) fn_addWidget(layout, view, 1, 0);
+    // Layout-managed: add wrapper. Bdwv path: set geometry directly.
+    if (layout && fn_addWidget) {
+        fn_addWidget(layout, wrapper, 1, 0);
+    } else if (fn_setGeo && wrapper) {
+        FakeQRect wgeo = {0, 0, 1071, 1447};
+        fn_setGeo(wrapper, &wgeo);
+        typedef void (*show_t)(void*);
+        static show_t fn_show = nullptr;
+        if (!fn_show) fn_show = (show_t)dlsym(RTLD_DEFAULT, "_ZN7QWidget4showEv");
+        if (fn_show) fn_show(wrapper);
+    }
 
     // Wire JS window.close() to dlg.accept() via QWebEnginePage signal.
     typedef void* (*pageGetter_t)(const void*);
@@ -456,16 +593,169 @@ static void show_webapp(void *parent, const char *index_path,
 
     // Position and size: full e-paper display, top-left corner. QRect uses
     // inclusive (x1,y1,x2,y2) so right/bottom are size-1.
-    const int SCREEN_W = 1072;
-    const int SCREEN_H = 1448;
-    FakeQRect geo = {0, 0, SCREEN_W - 1, SCREEN_H - 1};
+    // Leave a top gutter so nickel's status bar (battery, WiFi, time) stays
+    // visible above our dialog. The user can tap the WiFi indicator to
+    // troubleshoot connectivity without exiting the app and losing state.
+    // Status-bar height is roughly 88 px on this firmware.
+    const int SCREEN_W   = 1072;
+    const int SCREEN_H   = 1448;
+    const int TOP_GUTTER = 96;
+    FakeQRect geo = {0, TOP_GUTTER, SCREEN_W - 1, SCREEN_H - 1};
     if (fn_setGeo) fn_setGeo(dlg, &geo);
 
-    dbglog("apps: launching %s -> %s", display_name, urlBuf);
+    // Make sure the WebView has keyboard/touch focus the moment the dialog
+    // opens — otherwise the first tap on a tile only activates the window
+    // and doesn't reach the page. setFocus is a QWidget slot; queue it via
+    // QTimer::singleShot so it fires once the event loop in exec() is
+    // running.
+    typedef void (*singleShot_t)(int, const void*, const char*);
+    static singleShot_t fn_ss2 = nullptr;
+    if (!fn_ss2) fn_ss2 = (singleShot_t)dlsym(RTLD_DEFAULT,
+        "_ZN6QTimer10singleShotEiPK7QObjectPKc");
+    typedef void (*activate_t)(void*);
+    static activate_t fn_activate = nullptr;
+    if (!fn_activate) fn_activate = (activate_t)dlsym(RTLD_DEFAULT,
+        "_ZN7QWidget14activateWindowEv");
+    if (fn_activate) fn_activate(dlg);
+    if (fn_ss2) {
+        fn_ss2(0, dlg,  "1activateWindow()");
+        fn_ss2(0, view, "1setFocus()");
+    }
+
+    // Per-app refresh policy from manifest.json next to index.html.
+    // Default fast/monochrome (no flash). Apps that genuinely need color
+    // fidelity (e.g. photos, image-rich crosswords) declare
+    // {"refresh":"color"} in their manifest. PARTIAL preserves existing
+    // color pixels just fine for vivid hues; pastels fade either way
+    // due to Kaleido 3's limited color depth.
+    g_app_color_mode = 0;
+    {
+        const char *slash = strrchr(index_path, '/');
+        if (slash) {
+            int len = slash - index_path;
+            char manifest[320];
+            if (len < (int)sizeof(manifest) - 32) {
+                memcpy(manifest, index_path, len);
+                strcpy(manifest + len, "/manifest.json");
+                FILE *mf = fopen(manifest, "r");
+                if (mf) {
+                    char buf[1024]; size_t n = fread(buf, 1, sizeof(buf)-1, mf); fclose(mf);
+                    buf[n] = 0;
+                    if (strstr(buf, "\"refresh\"") && strstr(buf, "\"color\"")) {
+                        g_app_color_mode = 1;
+                        dbglog("apps: manifest -> color refresh");
+                    }
+                }
+            }
+        }
+    }
+
+    dbglog("apps: launching %s -> %s color=%d", display_name, urlBuf, g_app_color_mode);
     g_app_active = 1;
     fn_exec_local(dlg);
     g_app_active = 0;
+    g_app_color_mode = 0;
+    // Tell nickel to repaint the Mehr menu (the parent widget) so its
+    // pixels are fresh in the framebuffer; then a GC16 cleanup refresh
+    // pushes them out cleanly. Without the update() the EPDC refresh just
+    // re-displays the stale ghost pixels Qt never overwrote.
+    typedef void (*upd_t)(void*);
+    static upd_t fn_update  = nullptr;
+    static upd_t fn_repaint = nullptr;
+    if (!fn_update)  fn_update  = (upd_t)dlsym(RTLD_DEFAULT, "_ZN7QWidget6updateEv");
+    if (!fn_repaint) fn_repaint = (upd_t)dlsym(RTLD_DEFAULT, "_ZN7QWidget7repaintEv");
+    if (fn_update && parent)  fn_update(parent);
+    if (fn_repaint && parent) fn_repaint(parent);
+    if (epdc_fast_mode()) epdc_full_refresh();
     dbglog("apps: closed %s", display_name);
+}
+
+// Embed-mode launch via nickel's MainWindowController::pushView. Returns
+// true if the embed path succeeded (the view is now part of nickel's
+// navigation stack and the status bar / nav footer stay visible). False
+// means we should fall back to the floating QDialog launch.
+//
+// Opt-in via /mnt/onboard/.adds/tolinom-embed; when removed, the dialog
+// path is used so a bad nickel update can't strand the launcher.
+static bool try_show_launcher_embedded(const char *idx_path) {
+    if (access("/mnt/onboard/.adds/tolinom-embed", F_OK) != 0) return false;
+
+    typedef void* (*mwcInst_t)();
+    typedef void  (*pushView_t)(void*, void*);
+    static mwcInst_t  fn_mwcInst  = nullptr;
+    static pushView_t fn_pushView = nullptr;
+    if (!fn_mwcInst)  fn_mwcInst  = (mwcInst_t) dlsym(RTLD_DEFAULT, "_ZN20MainWindowController14sharedInstanceEv");
+    if (!fn_pushView) fn_pushView = (pushView_t)dlsym(RTLD_DEFAULT, "_ZN20MainWindowController8pushViewEP7QWidget");
+    if (!fn_mwcInst || !fn_pushView) return false;
+
+    void *mwc = fn_mwcInst();
+    if (!mwc) return false;
+
+    // QWebEngineView setup, same security flags as show_webapp.
+    typedef void  (*viewCtor_t)(void*, void*);
+    typedef void  (*viewSetUrl_t)(void*, const FakeQUrl*);
+    typedef void  (*urlCtor_t)(FakeQUrl*);
+    typedef void  (*urlSetUrl_t)(FakeQUrl*, const void*, int);
+    static viewCtor_t   fn_vCtor  = nullptr;
+    static viewSetUrl_t fn_vUrl   = nullptr;
+    static urlCtor_t    fn_uCtor  = nullptr;
+    static urlSetUrl_t  fn_uSetU  = nullptr;
+    if (!fn_vCtor) fn_vCtor = (viewCtor_t)  dlsym(RTLD_DEFAULT, "_ZN14QWebEngineViewC1EP7QWidget");
+    if (!fn_vUrl)  fn_vUrl  = (viewSetUrl_t)dlsym(RTLD_DEFAULT, "_ZN14QWebEngineView6setUrlERK4QUrl");
+    if (!fn_uCtor) fn_uCtor = (urlCtor_t)   dlsym(RTLD_DEFAULT, "_ZN4QUrlC1Ev");
+    if (!fn_uSetU) fn_uSetU = (urlSetUrl_t) dlsym(RTLD_DEFAULT, "_ZN4QUrl6setUrlERK7QStringNS_11ParsingModeE");
+    if (!fn_vCtor || !fn_vUrl || !fn_uCtor || !fn_uSetU) return false;
+
+    char urlBuf[512];
+    snprintf(urlBuf, sizeof(urlBuf), "file://%s", idx_path);
+    char16_t urlU[512];
+    int urlLen = ascii_to_u16(urlBuf, urlU, 512);
+    FakeQString urlQS = {nullptr, urlU, urlLen};
+    FakeQUrl url = {nullptr};
+    fn_uCtor(&url);
+    fn_uSetU(&url, &urlQS, 0);
+
+    // Build the view fresh — overallocate, no parent (pushView reparents).
+    void *view = fn_new(131072);
+    if (!view) return false;
+    fn_vCtor(view, nullptr);
+
+    // Web settings: allow file:// to fetch https:// (the same fix that
+    // unlocked the iframe to 20minutes / Keesing).
+    typedef void* (*pageOf_t)(const void*);
+    typedef void* (*settingsOf_t)(const void*);
+    typedef void  (*setAttr_t)(void*, int, bool);
+    static pageOf_t     fn_pageOf  = nullptr;
+    static settingsOf_t fn_settsOf = nullptr;
+    static setAttr_t    fn_settAtt = nullptr;
+    if (!fn_pageOf)  fn_pageOf  = (pageOf_t)    dlsym(RTLD_DEFAULT, "_ZNK14QWebEngineView4pageEv");
+    if (!fn_settsOf) fn_settsOf = (settingsOf_t)dlsym(RTLD_DEFAULT, "_ZNK14QWebEnginePage8settingsEv");
+    if (!fn_settAtt) fn_settAtt = (setAttr_t)   dlsym(RTLD_DEFAULT, "_ZN18QWebEngineSettings12setAttributeENS_12WebAttributeEb");
+    if (fn_pageOf && fn_settsOf && fn_settAtt) {
+        void *page = fn_pageOf(view);
+        if (page) {
+            void *settings = fn_settsOf(page);
+            if (settings) {
+                fn_settAtt(settings, 6,  true);
+                fn_settAtt(settings, 9,  true);
+                fn_settAtt(settings, 22, true);
+            }
+        }
+    }
+
+    fn_vUrl(view, &url);
+
+    // Disable Chromium context menu
+    typedef void (*setCtx_t)(void*, int);
+    static setCtx_t fn_setCtx = nullptr;
+    if (!fn_setCtx) fn_setCtx = (setCtx_t)dlsym(RTLD_DEFAULT,
+        "_ZN7QWidget20setContextMenuPolicyEN2Qt17ContextMenuPolicyE");
+    if (fn_setCtx) fn_setCtx(view, 0);
+
+    dbglog("apps: pushView(view=%p) on MWC=%p", view, mwc);
+    g_app_active = 1;
+    fn_pushView(mwc, view);
+    return true;
 }
 
 // Scan /mnt/onboard/.adds/apps/<name>/index.html, write a manifest
@@ -543,6 +833,13 @@ static void show_apps_launcher(void *parent) {
         return;
     }
 
+    // Try the embedded view path first (nickel's MainWindowController::
+    // pushView). If the user hasn't opted in via the flag file, falls back
+    // to the floating QDialog launch.
+    if (try_show_launcher_embedded(launcherIdx)) {
+        dbglog("apps: launcher embedded into nickel nav stack");
+        return;
+    }
     show_webapp(parent, launcherIdx, "Apps");
 }
 
@@ -922,6 +1219,31 @@ void nm_hook_setupUi(void *_this, QWidget *widget) {
     menuItemSetText_t fn_miSetText = (menuItemSetText_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItem7setTextERK7QString");
     menuItemRegGestures_t fn_miRegGest = (menuItemRegGestures_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItem22registerForTapGesturesEv");
 
+    // Native MenuTextItem can host an icon to the left of the text — same
+    // slot used by Activity / Settings / Hilfe etc. Adds visual parity and
+    // shapes the row to native height.
+    typedef void (*setLeftIcon_t)(void*, const void*);
+    typedef void (*pixmapCtor_t)(void*, const void*, const char*, int);
+    setLeftIcon_t fn_setLeftIcon = (setLeftIcon_t)dlsym(RTLD_DEFAULT, "_ZN12MenuTextItem16setLeftIconImageERK7QPixmap");
+    pixmapCtor_t  fn_pixCtor     = (pixmapCtor_t)dlsym(RTLD_DEFAULT, "_ZN7QPixmapC1ERK7QStringPKc6QFlagsIN2Qt19ImageConversionFlagEE");
+
+    auto setIconFor = [&](void *button, const char *path) {
+        if (!fn_setLeftIcon || !fn_pixCtor) return;
+        // QPixmap inherits QPaintDevice (vtable + a couple of fields) so it
+        // is bigger than a plain pointer; we need an actual heap buffer or
+        // the ctor will scribble past the end of our struct. Overallocate
+        // generously (64 bytes is a comfortable upper bound). We leak it,
+        // but setupUi only fires once per Mehr open.
+        void *pix = fn_new(64);
+        if (!pix) return;
+        memset(pix, 0, 64);
+        char16_t pathU[128];
+        int pathLen = ascii_to_u16(path, pathU, 128);
+        FakeQString pathQS = {nullptr, pathU, pathLen};
+        fn_pixCtor(pix, &pathQS, nullptr, 0);
+        fn_setLeftIcon(button, pix);
+    };
+
     if (!fn_miCtor) {
         dbglog("no MenuTextItem constructor");
         return;
@@ -933,6 +1255,7 @@ void nm_hook_setupUi(void *_this, QWidget *widget) {
     fn_miCtor(btn, (void*)ui[1], false, false);
     STACK_QS(label, u"Tolino Hacks", 12);
     fn_miSetText(btn, &label);
+    setIconFor(btn, "/mnt/onboard/.adds/icons/tolino-hacks.png");
     if (fn_miRegGest) fn_miRegGest(btn);
 
     // Force non-italic font (MenuTextItem defaults to italic for some states)
@@ -1001,6 +1324,7 @@ void nm_hook_setupUi(void *_this, QWidget *widget) {
         fn_miCtor(apbtn, (void*)ui[1], false, false);
         STACK_QS(aplabel, u"Apps", 4);
         fn_miSetText(apbtn, &aplabel);
+        setIconFor(apbtn, "/mnt/onboard/.adds/icons/apps.png");
         if (fn_miRegGest) fn_miRegGest(apbtn);
         if (fn_setSS) {
             STACK_QS(apcss, u"*{font-style:normal;font-weight:normal;}", 41);

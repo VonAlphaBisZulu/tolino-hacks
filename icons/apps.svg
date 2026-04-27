@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- A 3x3 grid of squares: classic launcher icon -->
+  <g fill="#000">
+    <rect x="6"  y="6"  width="14" height="14" rx="2"/>
+    <rect x="25" y="6"  width="14" height="14" rx="2"/>
+    <rect x="44" y="6"  width="14" height="14" rx="2"/>
+    <rect x="6"  y="25" width="14" height="14" rx="2"/>
+    <rect x="25" y="25" width="14" height="14" rx="2"/>
+    <rect x="44" y="25" width="14" height="14" rx="2"/>
+    <rect x="6"  y="44" width="14" height="14" rx="2"/>
+    <rect x="25" y="44" width="14" height="14" rx="2"/>
+    <rect x="44" y="44" width="14" height="14" rx="2"/>
+  </g>
+</svg>

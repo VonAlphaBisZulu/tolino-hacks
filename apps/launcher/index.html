@@ -5,17 +5,32 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Apps</title>
 <style>
-  /* The system UI font — same one nickel uses for its menus. */
-  @font-face{font-family:"Kobo Nickel";src:local("Kobo Nickel"),local("KoboNickel"),
-    url("file:///usr/share/fonts/KoboNickel.ttf") format("truetype");font-weight:400}
-  @font-face{font-family:"Kobo Nickel";src:local("Kobo Nickel Bold"),
-    url("file:///usr/share/fonts/KoboNickel-Bold.ttf") format("truetype");font-weight:700}
+  /* Tolino UI uses Rakuten's thin sans. Bariol is the classic Tolino
+     fallback (also installed); Noto Sans / DejaVu Sans cover anything else. */
+  @font-face{font-family:"Tolino UI";font-weight:400;
+    src:local("RakutenSansUIApp"),local("Rakuten Sans UI App"),
+        url("file:///usr/share/fonts/RakutenSansUIApp-Regular.ttf") format("truetype")}
+  @font-face{font-family:"Tolino UI";font-weight:700;
+    src:local("RakutenSansUIApp Bold"),
+        url("file:///usr/share/fonts/RakutenSansUIApp-Bold.ttf") format("truetype")}
+  @font-face{font-family:"Tolino UI";font-weight:300;
+    src:local("Bariol"),local("Bariol Light"),
+        url("file:///usr/share/fonts/Bariol-Regular.otf") format("opentype")}
 
   *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;
-    user-select:none;-webkit-user-select:none}
+    user-select:none;-webkit-user-select:none;
+    /* manipulation suppresses Chromium's 300ms wait-for-double-tap delay
+       which was eating the first tile tap. */
+    touch-action:manipulation}
   html,body{background:#fff;color:#000;height:100%;width:100%;overflow:hidden;
-    font-family:"Kobo Nickel","Noto Sans","DejaVu Sans",sans-serif}
-  body{display:flex;flex-direction:column;font-size:32px;line-height:1.4}
+    font-family:"Tolino UI","Noto Sans","DejaVu Sans",sans-serif}
+  /* 40px base — comfortable on 1072x1448 e-paper at arms length. */
+  /* Top padding leaves room for nickel's status bar (~100px) so our
+     header isn't covered when the launcher is pushed as an embedded
+     view via MainWindowController::pushView. In dialog mode the
+     padding lands inside the dialog frame — visually fine. */
+  body{display:flex;flex-direction:column;font-size:40px;line-height:1.4;
+       padding-top:100px}
 
   /* Header is the persistent system bar — sized to align with the
      overlaid native Qt close button (60px circle at y=16..75). */
@@ -25,7 +40,7 @@
   header .back{font-size:1.5em;background:none;border:none;color:#000;
     padding:8px 18px;border-radius:8px;cursor:pointer;visibility:hidden;
     font-family:inherit;min-width:64px;font-weight:400}
-  header .title{flex:1;font-size:1.4em;font-weight:700;text-align:center;
+  header .title{flex:1;font-size:1.4em;font-weight:400;text-align:center;
     overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 16px;
     /* Reserve space on the right for the Qt overlay × so titles don't
        collide with it. */
@@ -35,14 +50,14 @@
   main{flex:1;overflow:hidden;display:flex}
 
   #grid{display:grid;
-    grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
-    gap:32px;padding:40px;width:100%;align-content:start;
+    grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+    gap:36px;padding:48px;width:100%;align-content:start;
     overflow-y:auto}
 
   a.tile{display:flex;flex-direction:column;align-items:center;
-    text-decoration:none;color:#000;padding:32px 16px;
-    border:3px solid #000;border-radius:16px;
-    background:#fff;min-height:260px;justify-content:center;cursor:pointer}
+    text-decoration:none;color:#000;padding:40px 20px;
+    border:3px solid #000;border-radius:18px;
+    background:#fff;min-height:300px;justify-content:center;cursor:pointer}
   a.tile:active{background:#000;color:#fff}
   a.tile:active .icon{filter:invert(1)}
   /* The single-letter glyph stays large; the rest of the UI scaled up. */
@@ -72,7 +87,9 @@
 
 <main>
   <div id="grid"></div>
-  <iframe id="appframe" sandbox="allow-scripts allow-same-origin allow-forms allow-modals"></iframe>
+  <!-- No sandbox: an explicit attribute restricts even nested iframes
+       (and our motsfleches app needs to load https:// content). -->
+  <iframe id="appframe"></iframe>
 </main>
 
 <script>
@@ -80,6 +97,7 @@ const grid  = document.getElementById('grid');
 const frame = document.getElementById('appframe');
 const back  = document.getElementById('back');
 const title = document.getElementById('title');
+let lastTap = 0;
 
 function defaultIcon(name) {
   const div = document.createElement('div');
@@ -128,7 +146,24 @@ fetch('apps.json').then(r => r.json()).then(apps => {
     const a = document.createElement('a');
     a.className = 'tile';
     a.href = 'javascript:void(0)';
-    a.onclick = () => openApp(app);
+    // Fire on touchstart for snap response; preventDefault suppresses the
+    // synthesised click so we don't double-fire. Time-based debounce
+    // prevents accidental double-tap (and also sidesteps the closure-
+    // variable bug we had where the second tap on the same tile after
+    // returning via back was eaten by a stale "opened" flag).
+    a.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const now = Date.now();
+      if (now - lastTap < 400) return;
+      lastTap = now;
+      openApp(app);
+    });
+    a.addEventListener('click', () => {
+      const now = Date.now();
+      if (now - lastTap < 400) return;
+      lastTap = now;
+      openApp(app);
+    });
     a.appendChild(appIcon(app));
     const n = document.createElement('div');
     n.className = 'name';

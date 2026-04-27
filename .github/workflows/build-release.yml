@@ -24,10 +24,22 @@ jobs:
             echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install ARM cross-compiler
+      - name: Install ARM cross-compiler + rsvg-convert
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf librsvg2-bin
+
+      - name: Render Mehr-menu icons (SVG -> PNG; nickel's QPixmap path
+                                     uses the built-in PNG plugin, no SVG)
+        run: |
+          if [ -d icons ]; then
+            for svg in icons/*.svg; do
+              [ -f "$svg" ] || continue
+              png="${svg%.svg}.png"
+              rsvg-convert -w 64 -h 64 "$svg" -o "$png"
+            done
+            ls -la icons/
+          fi
 
       - name: Build libtolinom.so (public variant — no reverse tunnel)
         env:
@@ -70,6 +82,11 @@ jobs:
           if [ -d apps ]; then
             mkdir -p "$STAGING/.adds/apps"
             cp -r apps/* "$STAGING/.adds/apps/"
+          fi
+          # Mehr-menu icons (gear for Tolino Hacks, grid for Apps).
+          if [ -d icons ]; then
+            mkdir -p "$STAGING/.adds/icons"
+            cp -r icons/* "$STAGING/.adds/icons/"
           fi
 
           (cd "$STAGING" && tar cf "$GITHUB_WORKSPACE/update.tar" driver.sh .adds/)

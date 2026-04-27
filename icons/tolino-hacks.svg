@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- A wrench: settings / "hacks" -->
+  <g fill="none" stroke="#000" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M40 8 a14 14 0 0 0 -8 25 l-22 22 a4 4 0 0 0 5.7 5.7 l22 -22 a14 14 0 0 0 17 -17 l-7 7 -7 -7 z"/>
+  </g>
+</svg>
